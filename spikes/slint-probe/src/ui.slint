@@ -1,0 +1,47 @@
+import { CheckBox } from "std-widgets.slint";
+
+// Probe: single note card, one per window. Main spawns N of these to mirror
+// MS Sticky-Notes' "20 notes = 20 small windows" workload.
+export component SlintProbe inherits Window {
+    title: "Slint note probe";
+    preferred-width: 220px;
+    preferred-height: 260px;
+
+    VerticalLayout {
+        padding: 8px;
+        spacing: 4px;
+
+        Text {
+            text: "Note";
+            font-weight: 600;
+            font-size: 15px;
+        }
+        Text {
+            text: "Finish the quarterly report by";
+            color: #333333;
+        }
+        HorizontalLayout {
+            spacing: 6px;
+            Text {
+                text: "Buy milk and eggs";
+            }
+            Rectangle {
+                width: 110px;
+                height: 22px;
+                border-radius: 11px;
+                background: #DCE8FF;
+                Text {
+                    text: "📅 Sep 18 · 5 PM";
+                    font-size: 11px;
+                }
+            }
+        }
+        CheckBox {
+            text: "Review draft";
+        }
+        CheckBox {
+            text: "Send to team";
+            checked: true;
+        }
+    }
+}
