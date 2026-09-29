@@ -3,3 +3,15 @@ dist
 src-tauri/target
 *.local
 spikes/*/target
+
+# Local planning, spike notes, and generated acceptance evidence.
+/DESIGN-UI.md
+/docs/
+/slint-app/*.md
+/slint-app/docs/
+
+# Machine-local configuration and diagnostic output.
+.env
+.env.*
+!.env.example
+*.log

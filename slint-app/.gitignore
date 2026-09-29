@@ -1,0 +1,15 @@
+# Rust build output, including alternate release-validation targets.
+/target/
+/target-*/
+
+# Local SQLite data and transient write-ahead-log files.
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Isolated editor acceptance/performance workspaces. Keep the small JSON
+# reports in docs/ as committable evidence, but never commit their databases.
+/docs/editor-acceptance-v*/
+/docs/*.sandbox/

@@ -1,0 +1,723 @@
+import { Button, CheckBox, LineEdit, ScrollView } from "std-widgets.slint";
+
+export struct NoteCard {
+    id: string,
+    title: string,
+    preview: string,
+    color: color,
+    pinned: bool,
+}
+
+export struct InlineRun {
+    kind: string,
+    text: string,
+    chip-label: string,
+    bold: bool,
+}
+
+export struct ChecklistPreviewItem {
+    line-index: int,
+    text: string,
+    checked: bool,
+}
+
+// Serialized markers are projected into clickable native date labels. This
+// model supplies the bounded picker and the non-Windows fallback surface.
+export struct DateChipItem {
+    occurrence: int,
+    date: string,
+    label: string,
+}
+
+export struct CalendarDay { label: string, date: string, selected: bool, in-month: bool }
+export struct CalendarWeek { days: [CalendarDay] }
+
+// Slint 1.9's public TextEdit wraps a native TextInput but does not expose its
+// selection offsets. This small local wrapper retains the normal multiline,
+// wrapping and keyboard behaviour while making that native selection available
+// to the formatting toolbar. Offsets are UTF-8 byte offsets, matching
+// TextInput's own editing API.
+component SelectionEditor inherits Rectangle {
+    in-out property <string> text;
+    in property <bool> native-mode: false;
+    in property <bool> read-only: false;
+    in property <string> placeholder-text;
+    in property <color> text-color: #32343d;
+    out property <int> cursor-byte-offset: text-input.cursor-position_byte-offset;
+    out property <int> anchor-byte-offset: text-input.anchor-position-byte-offset;
+    in-out property <int> list-command-offset: -1;
+    callback edited(string);
+    callback apply-shortcut(string, int, int);
+    callback apply-list-command(string, int, int);
+    callback escape-pressed();
+
+    public function restore-selection(start: int, end: int) {
+        if (!root.native-mode && !root.read-only) {
+            text-input.set-selection-offsets(start, end);
+            text-input.focus();
+        }
+    }
+
+    public function apply-list(command: string) {
+        root.list-command-offset = -1;
+        root.apply-list-command(command, text-input.anchor-position-byte-offset, text-input.cursor-position-byte-offset);
+        if (root.list-command-offset >= 0 && !root.native-mode && !root.read-only) {
+            text-input.set-selection-offsets(root.list-command-offset, root.list-command-offset);
+            text-input.focus();
+        }
+    }
+
+    scroll-view := ScrollView {
+        width: parent.width;
+        height: parent.height;
+        viewport-width: self.visible-width;
+        viewport-height: max(self.visible-height, text-input.preferred-height);
+
+        text-input := TextInput {
+            text: root.native-mode ? "" : root.text;
+            width: parent.width;
+            wrap: word-wrap;
+            single-line: false;
+            enabled: !root.read-only;
+            color: root.text-color;
+            selection-background-color: #7662c999;
+            selection-foreground-color: #ffffff;
+            edited => { root.text = self.text; root.edited(self.text); }
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    root.escape-pressed();
+                    return accept;
+                }
+                if (event.modifiers.control && !event.modifiers.shift && event.text == "b") {
+                    root.apply-shortcut("bold", self.anchor-position-byte-offset, self.cursor-position_byte-offset);
+                    return accept;
+                }
+                if (event.modifiers.control && !event.modifiers.shift && event.text == "i") {
+                    root.apply-shortcut("italic", self.anchor-position-byte-offset, self.cursor-position_byte-offset);
+                    return accept;
+                }
+                if (event.modifiers.control && !event.modifiers.shift && event.text == "u") {
+                    root.apply-shortcut("underline", self.anchor-position-byte-offset, self.cursor-position_byte-offset);
+                    return accept;
+                }
+                if (!event.modifiers.control && !event.modifiers.alt && event.text == Key.Return) {
+                    root.list-command-offset = -1;
+                    root.apply-list-command("enter", self.anchor-position-byte-offset, self.cursor-position-byte-offset);
+                    if (root.list-command-offset >= 0) {
+                        self.set-selection-offsets(root.list-command-offset, root.list-command-offset);
+                        return accept;
+                    }
+                }
+                reject
+            }
+        }
+    }
+
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.text == "" && text-input.preedit-text == "" ? root.placeholder-text : "";
+        color: root.text-color;
+        vertical-alignment: top;
+        wrap: word-wrap;
+        accessible-role: none;
+    }
+}
+
+// A semantic, focusable color target rather than an anonymous hit area. The
+// colored rectangle preserves the familiar sticky-note palette while the
+// FocusScope supplies Space/Enter activation for keyboard users.
+component ColorSwatch inherits Rectangle {
+    in property <color> swatch-color;
+    in property <string> label;
+    in property <bool> selected;
+    callback activated();
+
+    background: swatch-color;
+    accessible-role: button;
+    accessible-label: label;
+    accessible-checkable: true;
+    accessible-checked: selected;
+    accessible-action-default => { root.activated(); }
+    forward-focus: keyboard-focus;
+
+    keyboard-focus := FocusScope {
+        width: parent.width;
+        height: parent.height;
+        key-pressed(event) => {
+            if (event.text == Key.Space || event.text == Key.Return) {
+                root.activated();
+                return accept;
+            }
+            reject
+        }
+    }
+    TouchArea { width: parent.width; height: parent.height; clicked => { root.activated(); } }
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.selected ? "✓" : "";
+        color: root.swatch-color == #6F7078 ? #ffffff : #24252a;
+        font-size: 17px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        accessible-role: none;
+    }
+}
+
+// A reminder is deliberately kept separate from a note card. A due date can
+// have more than one chip in the same note, and the native surface needs the
+// stable projection id when the user completes or dismisses it.
+export struct ReminderCard {
+    id: string,
+    title: string,
+    label: string,
+    due-label: string,
+}
+
+export component BoardWindow inherits Window {
+    title: "Sticky Notes+";
+    preferred-width: 920px;
+    preferred-height: 680px;
+    background: #f4f5f7;
+    in-out property <[NoteCard]> notes;
+    in-out property <[ReminderCard]> due-reminders;
+    in-out property <string> query;
+    in-out property <string> board-view: "notes";
+    in-out property <string> pending-purge-id: "";
+    in-out property <bool> reminder-panel-open: true;
+    callback search(string);
+    callback select-board-view(string);
+    callback create-note();
+    callback open-note(string);
+    callback delete-note(string);
+    callback archive-note(string, bool);
+    callback restore-note(string);
+    callback request-purge(string);
+    callback confirm-purge(string);
+    callback cancel-purge();
+    callback toggle-pin(string, bool);
+    callback select-color(string, string);
+    callback dismiss-reminder(string);
+    callback complete-reminder(string);
+    callback snooze-reminder(string);
+
+    VerticalLayout {
+        padding: 24px;
+        spacing: 12px;
+        HorizontalLayout {
+            spacing: 12px;
+            Text { text: "Sticky Notes+"; font-size: 24px; font-weight: 700; color: #25262c; vertical-alignment: center; }
+            Rectangle { horizontal-stretch: 1; }
+            LineEdit { placeholder-text: "Search your notes"; text <=> query; edited => { root.search(self.text); } width: 230px; }
+            Button { text: root.reminder-panel-open ? "Hide reminders" : "Reminders"; clicked => { root.reminder-panel-open = !root.reminder-panel-open; } }
+            Button { text: "+ New note"; primary: true; clicked => { root.create-note(); } }
+        }
+        HorizontalLayout {
+            spacing: 7px;
+            Button { text: "Notes"; primary: root.board-view == "notes"; clicked => { root.select-board-view("notes"); } }
+            Button { text: "Archive"; primary: root.board-view == "archive"; clicked => { root.select-board-view("archive"); } }
+            Button { text: "Deleted"; primary: root.board-view == "deleted"; clicked => { root.select-board-view("deleted"); } }
+            Rectangle { horizontal-stretch: 1; }
+            Text {
+                text: root.board-view == "notes" ? notes.length + " active notes" : root.board-view == "archive" ? "Archived notes — reminders still run" : "Deleted notes stay recoverable until removed forever";
+                color: #737887;
+                font-size: 12px;
+                vertical-alignment: center;
+            }
+        }
+        Rectangle { height: 1px; background: #dfe2ea; }
+        Rectangle {
+            visible: root.reminder-panel-open && due-reminders.length > 0;
+            height: 116px;
+            background: #fff7d6;
+            border-width: 1px;
+            border-color: #d8bc63;
+            border-radius: 10px;
+            padding: 8px;
+            VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: "Due reminders — act now or clear them";
+                    font-size: 12px;
+                    font-weight: 700;
+                    color: #66521b;
+                }
+                ScrollView {
+                    viewport-width: self.visible-width;
+                    VerticalLayout {
+                    spacing: 4px;
+                    for reminder in due-reminders: Rectangle {
+                        height: 34px;
+                        min-width: 0px;
+                        horizontal-stretch: 1;
+                        background: #ffffff99;
+                        border-radius: 6px;
+                        HorizontalLayout {
+                            padding-left: 7px;
+                            padding-right: 4px;
+                            spacing: 6px;
+                            Text {
+                                text: reminder.title == "" ? "Untitled note" : reminder.title;
+                                width: 130px;
+                                font-size: 12px;
+                                font-weight: 700;
+                                overflow: elide;
+                                vertical-alignment: center;
+                            }
+                            Text {
+                                text: reminder.label == "" ? reminder.due-label : reminder.label + " · " + reminder.due-label;
+                                horizontal-stretch: 1;
+                                color: #695b35;
+                                font-size: 11px;
+                                overflow: elide;
+                                vertical-alignment: center;
+                            }
+                            Button { text: "Mark done"; clicked => { root.complete-reminder(reminder.id); } }
+                            Button { text: "Snooze 10m"; clicked => { root.snooze-reminder(reminder.id); } }
+                            Button { text: "Dismiss"; clicked => { root.dismiss-reminder(reminder.id); } }
+                        }
+                    }
+                    }
+                }
+            }
+        }
+        Rectangle {
+            visible: root.pending-purge-id != "";
+            height: root.pending-purge-id != "" ? 44px : 0px;
+            background: #fff0f0;
+            border-width: 1px;
+            border-color: #d98a8a;
+            border-radius: 8px;
+            HorizontalLayout {
+                padding-left: 10px;
+                padding-right: 7px;
+                spacing: 8px;
+                Text {
+                    text: "Permanently delete this note? This cannot be undone.";
+                    color: #7b2727;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    font-size: 12px;
+                }
+                Button { text: "Cancel"; clicked => { root.cancel-purge(); } }
+                Button { text: "Delete forever"; clicked => { root.confirm-purge(root.pending-purge-id); } }
+            }
+        }
+        ScrollView {
+            viewport-width: self.visible-width;
+            VerticalLayout {
+                spacing: 10px;
+            for card in notes: Rectangle {
+                background: card.color;
+                border-radius: 8px;
+                border-width: 1px;
+                border-color: #00000018;
+                horizontal-stretch: 1;
+                min-width: 0px;
+                height: 142px;
+                padding: 14px;
+                TouchArea { enabled: root.board-view != "deleted"; clicked => { root.open-note(card.id); } }
+                VerticalLayout {
+                    spacing: 8px;
+                    HorizontalLayout {
+                        Text { text: card.title; font-size: 17px; font-weight: 700; overflow: elide; horizontal-stretch: 1; }
+                        Text { text: card.pinned ? "★" : "☆"; font-size: 18px; color: #6f5bb8; }
+                    }
+                    Text { text: card.preview == "" ? "Empty note" : card.preview; color: #454854; vertical-stretch: 1; overflow: elide; wrap: word-wrap; }
+                    HorizontalLayout {
+                        spacing: 5px;
+                        Button { visible: root.board-view == "notes"; text: card.pinned ? "Unpin" : "Pin"; clicked => { root.toggle-pin(card.id, !card.pinned); } }
+                        Button { visible: root.board-view == "notes"; text: "Archive"; clicked => { root.archive-note(card.id, true); } }
+                        Button { visible: root.board-view == "archive"; text: "Unarchive"; clicked => { root.archive-note(card.id, false); } }
+                        Button { visible: root.board-view == "deleted"; text: "Restore"; clicked => { root.restore-note(card.id); } }
+                        Button { visible: root.board-view != "deleted"; text: "Delete"; clicked => { root.delete-note(card.id); } }
+                        Button { visible: root.board-view == "deleted"; text: "Delete forever"; clicked => { root.request-purge(card.id); } }
+                        Rectangle { horizontal-stretch: 1; }
+                        TouchArea { visible: root.board-view != "deleted"; width: 18px; height: 18px; clicked => { root.select-color(card.id, "#FFF9B1"); } Rectangle { background: #FFF9B1; border-radius: 9px; } }
+                        TouchArea { visible: root.board-view != "deleted"; width: 18px; height: 18px; clicked => { root.select-color(card.id, "#DCE8FF"); } Rectangle { background: #DCE8FF; border-radius: 9px; } }
+                        TouchArea { visible: root.board-view != "deleted"; width: 18px; height: 18px; clicked => { root.select-color(card.id, "#D9F7BE"); } Rectangle { background: #D9F7BE; border-radius: 9px; } }
+                    }
+                }
+            }
+            }
+        }
+        Text { text: notes.length == 0 ? root.board-view == "notes" ? "No notes yet. Create one to keep a thought close at hand." : root.board-view == "archive" ? "Your archive is empty. Archived notes can always return to Notes." : "Nothing is in Deleted notes. Deleted notes can be restored here." : root.board-view == "deleted" ? "Restore a note, or permanently delete it when you are certain." : "Open a note to edit it. Changes save automatically on this device."; color: #656a76; horizontal-alignment: center; }
+    }
+}
+
+export component NoteWindow inherits Window {
+    title: note-title == "" ? "Sticky Note" : note-title;
+    preferred-width: 360px;
+    preferred-height: 390px;
+    // Keep the native window resizable on every backend. Without explicit
+    // lower bounds, the layout's inferred constraints can collapse the
+    // horizontal resize range for freshly-created windows in winit.
+    min-width: 260px;
+    min-height: 180px;
+    // Keep the native resize range open in both directions. The layout below
+    // contains several fixed-width controls, so relying on its inferred
+    // maximum can make winit clamp horizontal growth to the initial width.
+    max-width: 1600px;
+    // Make the edge hit target explicit for the winit backend. This is
+    // especially useful for borderless/theme-dependent window decorations.
+    resize-border-width: 8px;
+    in-out property <string> note-title;
+    in-out property <color> note-color;
+    // Keep the selected hex value alongside the rendered color. The Rust
+    // persistence layer needs the exact palette value, not a converted color.
+    in-out property <string> note-color-value;
+    in-out property <string> editor-text;
+    in-out property <string> editor-chip-identities: "[]";
+    in-out property <bool> native-editor-active: false;
+    in-out property <float> native-client-width: 0;
+    in-out property <float> native-client-height: 0;
+    property <length> content-width: native-client-width > 0 ? min(root.width, native-client-width * 1px) : root.width;
+    property <length> content-height: native-client-height > 0 ? min(root.height, native-client-height * 1px) : root.height;
+    in-out property <bool> editor-bold;
+    // This property started as boldRanges. It now carries all inline style
+    // ranges while remaining compatible with older stored JSON arrays.
+    in-out property <string> editor-bold-ranges;
+    in-out property <int> editor-list-command-offset: -1;
+    in-out property <bool> note-always-on-top;
+    in-out property <[InlineRun]> inline-runs;
+    in-out property <[ChecklistPreviewItem]> checklist-items;
+    in-out property <[DateChipItem]> date-chips;
+    in-out property <bool> date-panel-open: false;
+    in-out property <float> date-anchor-x: 12;
+    in-out property <float> date-anchor-y: 44;
+    in-out property <string> date-input;
+    in-out property <string> date-time-input;
+    in-out property <string> date-repeat: "none";
+    in-out property <string> date-error;
+    in-out property <string> calendar-caption;
+    in-out property <int> calendar-year;
+    in-out property <int> calendar-month;
+    in-out property <[CalendarWeek]> calendar-weeks;
+    in-out property <int> date-insert-offset: -1;
+    in-out property <string> date-preview-text;
+    in-out property <int> selected-date-occurrence: -1;
+    // Live logical bounds of the fallback editor, for the native RichEdit
+    // host. Keeping this binding in Slint prevents hard-coded placement.
+    out property <length> editor-left: note-layout.editor-left;
+    out property <length> editor-top: note-layout.editor-top;
+    out property <length> editor-width: note-layout.editor-width;
+    out property <length> editor-height: note-layout.editor-height;
+    property <color> note-foreground: note-color-value == "#6F7078" ? #f5f5f6 : #32343d;
+    property <bool> header-pinned: false;
+    property <bool> overflow-open: false;
+    in-out property <string> format-status;
+    in-out property <string> save-status;
+    callback save(string, bool, string);
+    callback create-note();
+    callback close-note();
+    callback open-board();
+    callback choose-color(string);
+    callback insert-date-chip();
+    callback toggle-date-panel();
+    callback set-native-editor-visible(bool);
+    callback editor-history-action(bool);
+    callback select-date-occurrence(int);
+    callback apply-date-selection();
+    callback remove-selected-date();
+    callback dismiss-date-panel();
+    callback move-calendar-month(int);
+    callback pick-calendar-day(string);
+    callback toggle-selection-style(string, int, int);
+    callback apply-list-command(string, int, int);
+    callback editor-text-edited(string);
+    callback toggle-always-on-top();
+    callback toggle-checklist(int, bool);
+    callback delete-note();
+    changed date-panel-open => { if (root.date-panel-open) { date-keyboard.focus(); } }
+    background: note-color;
+    // A compact sticky-note surface. The thin hit target keeps the header
+    // discoverable without permanently taking space from the note body. A
+    // click pins it open for touch users, where hover is unavailable.
+    TouchArea {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: 34px;
+        clicked => { root.dismiss-date-panel(); }
+    }
+    // The popup takes focus as soon as it opens. Child controls retain normal
+    // tab navigation and unhandled Escape bubbles back to this scope.
+    menu-keyboard := FocusScope {
+        key-pressed(event) => {
+            if (event.text == Key.Escape && root.overflow-open) {
+                root.overflow-open = false;
+                root.set-native-editor-visible(true);
+                return accept;
+            }
+            reject
+        }
+    }
+    note-layout := VerticalLayout {
+        width: root.content-width;
+        height: root.content-height;
+        out property <length> editor-left: self.x + editor-surface.x + 10px;
+        out property <length> editor-top: self.y + editor-surface.y + 10px;
+        out property <length> editor-width: max(0px, editor-surface.width - 20px);
+        out property <length> editor-height: max(0px, editor-surface.height - 20px);
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 8px;
+        padding-bottom: 10px;
+        spacing: 7px;
+        Rectangle {
+            height: 28px;
+            background: header-hit.has-hover || root.overflow-open ? #00000012 : #00000000;
+            border-radius: 7px;
+            // Header controls are intentionally quiet until the pointer enters
+            // the note; touch users can reveal them by tapping the top strip.
+            visible: true;
+            header-hit := TouchArea {
+                x: 0px;
+                y: 0px;
+                width: parent.width;
+                height: parent.height;
+                HorizontalLayout {
+                width: parent.width;
+                height: parent.height;
+                padding-left: 5px;
+                padding-right: 4px;
+                spacing: 4px;
+                Button { visible: header-hit.has-hover || root.overflow-open; text: "+"; width: 28px; clicked => { root.create-note(); } }
+                Text {
+                    text: header-hit.has-hover || root.overflow-open ? (note-title == "" ? "Untitled note" : note-title) : "";
+                    font-size: 14px;
+                    font-weight: 700;
+                    color: root.note-foreground;
+                    horizontal-stretch: 1;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Button { visible: header-hit.has-hover || root.overflow-open; text: "⋯"; width: 30px; clicked => { root.overflow-open = !root.overflow-open; root.set-native-editor-visible(!root.overflow-open); if (root.overflow-open) { menu-keyboard.focus(); } } }
+                Button { visible: header-hit.has-hover || root.overflow-open; text: "×"; width: 28px; clicked => { root.close-note(); } }
+                }
+            }
+        }
+        editor-surface := Rectangle {
+            vertical-stretch: 1;
+            // The colored sticky itself is the writing surface, not a card
+            // containing another card.
+            background: #00000000;
+            border-width: 0px;
+            padding: 10px;
+            editor-input := SelectionEditor {
+                // Do not render a second text editor beneath the child HWND.
+                // Retain its snapshot as context while canvas overlays are open.
+                visible: !root.native-editor-active || root.date-panel-open || root.overflow-open;
+                native-mode: root.native-editor-active && !root.date-panel-open && !root.overflow-open;
+                read-only: root.native-editor-active;
+                width: parent.width;
+                height: parent.height;
+                text: root.native-editor-active ? root.date-preview-text : root.editor-text;
+                text-color: root.note-foreground;
+                placeholder-text: "Write a note…\nUse [ ] for checklist items.";
+                edited => { root.editor-text = self.text; root.editor-text-edited(self.text); }
+                escape-pressed => {
+                    if (root.overflow-open) {
+                        root.overflow-open = false;
+                        root.set-native-editor-visible(true);
+                    }
+                }
+                apply-shortcut(style, anchor, cursor) => {
+                    root.toggle-selection-style(style, anchor, cursor);
+                    self.restore-selection(anchor, cursor);
+                }
+                apply-list-command(command, anchor, cursor) => {
+                    root.editor-list-command-offset = -1;
+                    root.apply-list-command(command, anchor, cursor);
+                    self.list-command-offset = root.editor-list-command-offset;
+                }
+            }
+        }
+        // Conditional creation removes this preview's layout constraints too;
+        // merely hiding it still reserves its height in the vertical layout.
+        if checklist-items.length > 0 && root.content-height >= 330px: Rectangle {
+            background: root.note-color-value == "#6F7078" ? #00000025 : #ffffff75;
+            border-width: 1px;
+            border-color: #00000018;
+            border-radius: 8px;
+            padding: 7px;
+            min-height: 30px;
+            VerticalLayout {
+                spacing: 4px;
+                for item in checklist-items: HorizontalLayout {
+                    spacing: 6px;
+                    CheckBox {
+                        checked: item.checked;
+                        toggled => { root.toggle-checklist(item.line-index, self.checked); }
+                    }
+                    Text { text: item.text; color: item.checked ? (root.note-color-value == "#6F7078" ? #dddddf : #777760) : root.note-foreground; vertical-alignment: center; horizontal-stretch: 1; overflow: elide; }
+                }
+            }
+        }
+        Text {
+            visible: root.format-status != "";
+            text: root.format-status;
+            font-size: 10px;
+            color: #66521b;
+            overflow: elide;
+        }
+        Rectangle {
+            height: 64px;
+            background: #ffffff55;
+            border-radius: 8px;
+            VerticalLayout {
+                spacing: 4px;
+            HorizontalLayout {
+                spacing: 4px;
+                Button { text: "Save"; width: 52px; clicked => { root.save(editor-text, editor-bold, editor-bold-ranges); } }
+                Button { text: "B"; width: 32px; clicked => { root.toggle-selection-style("bold", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                Button { text: "I"; width: 32px; clicked => { root.toggle-selection-style("italic", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                Button { text: "U"; width: 32px; clicked => { root.toggle-selection-style("underline", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                Button { text: "S"; width: 32px; clicked => { root.toggle-selection-style("strike", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                Text {
+                    text: root.save-status == "" ? "Changes stay local" : root.save-status;
+                    color: root.save-status == "" ? #766f5e : #66521b;
+                    font-size: 10px;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    min-width: 0px;
+                    overflow: elide;
+                }
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                Button { text: "• List"; clicked => { editor-input.apply-list("bullet"); } }
+                Button { text: "☐ Task"; clicked => { editor-input.apply-list("checklist"); } }
+                Button { text: "＋ date"; clicked => { root.toggle-date-panel(); } }
+                Button { visible: root.native-editor-active; text: "Undo"; width: 42px; clicked => { root.editor-history-action(false); } }
+                Button { visible: root.native-editor-active; text: "Redo"; width: 42px; clicked => { root.editor-history-action(true); } }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            }
+        }
+    }
+    // This is an overlay, not a layout child: opening it never moves the
+    // editor or the bottom toolbar. The full-width menu mirrors Windows
+    // Sticky Notes and gives each color a large, keyboard-reachable target.
+    Rectangle {
+        visible: root.overflow-open;
+        width: parent.width;
+        height: parent.height;
+        background: #00000000;
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => { root.overflow-open = false; root.set-native-editor-visible(true); }
+        }
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: parent.width;
+            height: min(146px, parent.height);
+            background: #fffdf8;
+            border-width: 1px;
+            border-color: #00000024;
+            TouchArea { width: parent.width; height: parent.height; }
+            VerticalLayout {
+                spacing: 0px;
+                HorizontalLayout {
+                    height: 34px;
+                    spacing: 0px;
+                    ColorSwatch { horizontal-stretch: 1; label: "Yellow"; swatch-color: #FFF9B1; selected: root.note-color-value == "#FFF9B1"; activated => { root.choose-color("#FFF9B1"); root.overflow-open = false; root.set-native-editor-visible(true); } }
+                    ColorSwatch { horizontal-stretch: 1; label: "Green"; swatch-color: #D9F7BE; selected: root.note-color-value == "#D9F7BE"; activated => { root.choose-color("#D9F7BE"); root.overflow-open = false; root.set-native-editor-visible(true); } }
+                    ColorSwatch { horizontal-stretch: 1; label: "Pink"; swatch-color: #FFD7E5; selected: root.note-color-value == "#FFD7E5"; activated => { root.choose-color("#FFD7E5"); root.overflow-open = false; root.set-native-editor-visible(true); } }
+                    ColorSwatch { horizontal-stretch: 1; label: "Purple"; swatch-color: #E6D8FF; selected: root.note-color-value == "#E6D8FF"; activated => { root.choose-color("#E6D8FF"); root.overflow-open = false; root.set-native-editor-visible(true); } }
+                    ColorSwatch { horizontal-stretch: 1; label: "Blue"; swatch-color: #DCE8FF; selected: root.note-color-value == "#DCE8FF"; activated => { root.choose-color("#DCE8FF"); root.overflow-open = false; root.set-native-editor-visible(true); } }
+                    ColorSwatch { horizontal-stretch: 1; label: "Light grey"; swatch-color: #E9E9E9; selected: root.note-color-value == "#E9E9E9"; activated => { root.choose-color("#E9E9E9"); root.overflow-open = false; root.set-native-editor-visible(true); } }
+                    ColorSwatch { horizontal-stretch: 1; label: "Dark grey"; swatch-color: #6F7078; selected: root.note-color-value == "#6F7078"; activated => { root.choose-color("#6F7078"); root.overflow-open = false; root.set-native-editor-visible(true); } }
+                }
+                Rectangle { height: 1px; background: #dedbd4; }
+                Button { text: "Notes list"; clicked => { root.open-board(); root.overflow-open = false; root.set-native-editor-visible(true); } }
+                Button { text: note-always-on-top ? "Remove from top" : "Keep on top"; clicked => { root.toggle-always-on-top(); root.overflow-open = false; root.set-native-editor-visible(true); } }
+                Button { text: "Delete note"; clicked => { root.delete-note(); root.overflow-open = false; root.set-native-editor-visible(true); } }
+            }
+        }
+    }
+    // This sits above the editor rather than consuming layout height. Its
+    // transparent TouchArea is a real click-away layer; the panel itself is
+    // stacked later and absorbs its own background clicks, leaving inputs and
+    // buttons usable while every other note click dismisses it.
+    Rectangle {
+        visible: root.date-panel-open;
+        width: root.content-width;
+        height: root.content-height;
+        background: #00000000;
+        TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => { root.dismiss-date-panel(); }
+        }
+        date-keyboard := FocusScope {
+            x: max(8px, min(root.date-anchor-x * 1px, parent.width - self.width - 8px));
+            y: max(8px, min(root.date-anchor-y * 1px + 16px, parent.height - 74px - self.height - 8px));
+            width: min(320px, parent.width - 16px);
+            // Keep the toolbar/date toggle reachable while this surface is
+            // open. Very small notes scroll the picker instead of covering it.
+            height: min(390px, max(60px, parent.height - 90px));
+            key-pressed(event) => { if (event.text == Key.Escape) { root.dismiss-date-panel(); return accept; } reject }
+        Rectangle {
+            width: parent.width; height: parent.height;
+            background: #fffdf2;
+            border-width: 1px;
+            border-color: #00000025;
+            border-radius: 8px;
+            padding: 7px;
+            // Consume clicks in the panel's non-control gaps, so only actual
+            // click-away targets dismiss the surface.
+            TouchArea { width: parent.width; height: parent.height; }
+            ScrollView {
+                width: parent.width; height: parent.height;
+                viewport-width: self.visible-width;
+            VerticalLayout {
+                padding: 8px;
+                spacing: 4px;
+                HorizontalLayout {
+                    Text { text: selected-date-occurrence >= 0 ? "Edit selected date" : "Add a date"; font-size: 11px; font-weight: 700; vertical-alignment: center; horizontal-stretch: 1; }
+                    Button { text: "×"; width: 28px; height: 28px; clicked => { root.dismiss-date-panel(); } }
+                }
+                HorizontalLayout {
+                    spacing: 4px;
+                    Button { text: "‹"; width: 30px; height: 28px; clicked => { root.move-calendar-month(-1); } }
+                    Text { text: root.calendar-caption; horizontal-stretch: 1; horizontal-alignment: center; vertical-alignment: center; font-size: 12px; }
+                    Button { text: "›"; width: 30px; height: 28px; clicked => { root.move-calendar-month(1); } }
+                }
+                HorizontalLayout {
+                    for label in ["M", "T", "W", "T", "F", "S", "S"]: Text { text: label; horizontal-stretch: 1; horizontal-alignment: center; color: #777777; font-size: 10px; }
+                }
+                for week in root.calendar-weeks: HorizontalLayout {
+                    spacing: 2px;
+                    for day in week.days: Button {
+                        text: day.selected ? "●" + day.label : day.label;
+                        min-width: 0px; preferred-width: 34px; horizontal-stretch: 1; height: 24px;
+                        clicked => { root.pick-calendar-day(day.date); }
+                    }
+                }
+                HorizontalLayout {
+                    LineEdit { text <=> root.date-input; placeholder-text: "YYYY-MM-DD"; horizontal-stretch: 1; }
+                    LineEdit { text <=> root.date-time-input; placeholder-text: "HH:mm (optional)"; width: 115px; }
+                }
+                HorizontalLayout {
+                    spacing: 3px;
+                    Button { text: "Once"; primary: root.date-repeat == "none"; clicked => { root.date-repeat = "none"; } }
+                    Button { text: "Daily"; primary: root.date-repeat == "daily"; clicked => { root.date-repeat = "daily"; } }
+                    Button { text: "Weekly"; primary: root.date-repeat == "weekly"; clicked => { root.date-repeat = "weekly"; } }
+                    Button { text: "Monthly"; primary: root.date-repeat == "monthly"; clicked => { root.date-repeat = "monthly"; } }
+                }
+                Text { visible: root.date-error != ""; text: root.date-error; color: #ab2e26; wrap: word-wrap; font-size: 10px; }
+                HorizontalLayout {
+                    Button { text: selected-date-occurrence >= 0 ? "Update" : "Insert date"; horizontal-stretch: 1; clicked => { root.apply-date-selection(); } }
+                    Button { visible: selected-date-occurrence >= 0; text: "Remove"; clicked => { root.remove-selected-date(); } }
+                }
+            }
+            }
+        }
+            }
+    }
+}
