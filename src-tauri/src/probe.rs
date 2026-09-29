@@ -5,16 +5,16 @@
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 pub fn spawn(app: &tauri::AppHandle, n: u32) {
-  for i in 0..n {
-    let label = format!("probe-{i}");
-    if app.get_webview_window(&label).is_some() {
-      continue;
+    for i in 0..n {
+        let label = format!("probe-{i}");
+        if app.get_webview_window(&label).is_some() {
+            continue;
+        }
+        WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
+            .decorations(false)
+            .always_on_top(true)
+            .inner_size(200.0, 260.0)
+            .build()
+            .expect("probe window");
     }
-    WebviewWindowBuilder::new(app, &label, WebviewUrl::App("index.html".into()))
-      .decorations(false)
-      .always_on_top(true)
-      .inner_size(200.0, 260.0)
-      .build()
-      .expect("probe window");
-  }
 }

@@ -12,11 +12,15 @@
     "typecheck": "svelte-check"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2"
+    "@tauri-apps/api": "^2",
+    "@tiptap/core": "^3.31.3",
+    "@tiptap/extension-underline": "^3.31.3",
+    "@tiptap/starter-kit": "^3.31.3"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^6",
     "@tauri-apps/cli": "^2",
+    "@tiptap/pm": "^3.31.3",
     "svelte": "^5",
     "svelte-check": "^4",
     "typescript": "^5",
