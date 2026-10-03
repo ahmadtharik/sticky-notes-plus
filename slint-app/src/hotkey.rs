@@ -7,6 +7,39 @@
 /// The documented global shortcut for opening a new sticky.
 pub const DEFAULT_SHORTCUT: &str = "Ctrl+Alt+N";
 
+pub fn parse_shortcut(value: &str) -> anyhow::Result<(u32, u32)> {
+    let parts: Vec<_> = value.split('+').map(str::trim).collect();
+    anyhow::ensure!(
+        parts.len() >= 2,
+        "Use Ctrl or Alt plus a letter, digit or F1–F24"
+    );
+    let mut modifiers = 0;
+    for part in &parts[..parts.len() - 1] {
+        let flag = match part.to_ascii_lowercase().as_str() {
+            "alt" => 1,
+            "ctrl" => 2,
+            "shift" => 4,
+            _ => anyhow::bail!("Unsupported shortcut modifier"),
+        };
+        anyhow::ensure!(modifiers & flag == 0, "Repeated shortcut modifier");
+        modifiers |= flag;
+    }
+    anyhow::ensure!(modifiers & 3 != 0, "Shortcut must include Ctrl or Alt");
+    let key = parts.last().unwrap().to_ascii_uppercase();
+    let key = if key.len() == 1 && key.as_bytes()[0].is_ascii_alphanumeric() {
+        u32::from(key.as_bytes()[0])
+    } else if let Some(number) = key
+        .strip_prefix('F')
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|number| (1..=24).contains(number))
+    {
+        0x70 + number - 1
+    } else {
+        anyhow::bail!("Use a letter, digit or F1–F24")
+    };
+    Ok((modifiers, key))
+}
+
 #[cfg(windows)]
 mod platform {
     use std::{
@@ -16,9 +49,7 @@ mod platform {
     use windows_sys::Win32::{
         Foundation::HWND,
         UI::{
-            Input::KeyboardAndMouse::{
-                RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, VK_N,
-            },
+            Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey, MOD_NOREPEAT},
             WindowsAndMessaging::{GetMessageW, MSG, WM_HOTKEY},
         },
     };
@@ -30,7 +61,8 @@ mod platform {
     }
 
     impl QuickCreate {
-        pub fn register_default() -> anyhow::Result<Self> {
+        pub fn register(shortcut: &str) -> anyhow::Result<Self> {
+            let (modifiers, key) = super::parse_shortcut(shortcut)?;
             let (ready_tx, ready_rx) = mpsc::sync_channel(1);
             let (command_tx, receiver) = mpsc::channel();
             thread::Builder::new()
@@ -40,8 +72,8 @@ mod platform {
                         RegisterHotKey(
                             std::ptr::null_mut::<core::ffi::c_void>() as HWND,
                             QUICK_CREATE_ID,
-                            MOD_CONTROL | MOD_ALT | MOD_NOREPEAT,
-                            u32::from(VK_N),
+                            modifiers | MOD_NOREPEAT,
+                            key,
                         )
                     };
                     if registered == 0 {
@@ -99,10 +131,10 @@ pub struct QuickCreate;
 
 #[cfg(not(windows))]
 impl QuickCreate {
-    pub fn register_default() -> anyhow::Result<Self> {
+    pub fn register(shortcut: &str) -> anyhow::Result<Self> {
+        parse_shortcut(shortcut)?;
         Ok(Self)
     }
-
     pub fn poll_quick_create(&self) -> bool {
         false
     }
@@ -115,5 +147,24 @@ mod tests {
     #[test]
     fn documents_the_default_shortcut() {
         assert_eq!(DEFAULT_SHORTCUT, "Ctrl+Alt+N");
+    }
+    #[test]
+    fn shortcuts_validate_modifiers_and_supported_keys() {
+        assert_eq!(super::parse_shortcut("Ctrl+Alt+N").unwrap(), (3, 78));
+        assert_eq!(
+            super::parse_shortcut(" alt + shift + f24 ").unwrap(),
+            (5, 0x87)
+        );
+        for invalid in [
+            "N",
+            "Shift+N",
+            "Ctrl+Ctrl+N",
+            "Win+N",
+            "Ctrl+",
+            "Ctrl+F25",
+            "Ctrl+日本語",
+        ] {
+            assert!(super::parse_shortcut(invalid).is_err(), "{invalid}");
+        }
     }
 }

@@ -1,4 +1,4 @@
-import { Button, CheckBox, LineEdit, ScrollView } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit, ScrollView, Palette } from "std-widgets.slint";
 
 export struct NoteCard {
     id: string,
@@ -180,13 +180,33 @@ export component BoardWindow inherits Window {
     title: "Sticky Notes+";
     preferred-width: 920px;
     preferred-height: 680px;
-    background: #f4f5f7;
+    min-width: 560px;
+    min-height: 440px;
+    max-width: 1800px;
+    background: root.dark-theme ? #202228 : #f4f5f7;
+    in-out property <bool> dark-theme: false;
+    in-out property <bool> settings-open: false;
+    in-out property <bool> setting-dark: false;
+    in-out property <bool> setting-startup: false;
+    in-out property <string> setting-shortcut;
+    in-out property <string> settings-status;
+    property <color> board-foreground: root.dark-theme ? #f1f2f5 : #25262c;
+    property <color> board-muted: root.dark-theme ? #b8bdc9 : #737887;
+    callback apply-settings();
+    in-out property <bool> import-pending: false;
+    in-out property <string> import-status;
+    callback preview-import();
+    callback confirm-import();
+    callback cancel-import();
+    init => { Palette.color-scheme = root.dark-theme ? ColorScheme.dark : ColorScheme.light; }
+    changed dark-theme => { Palette.color-scheme = root.dark-theme ? ColorScheme.dark : ColorScheme.light; }
     in-out property <[NoteCard]> notes;
     in-out property <[ReminderCard]> due-reminders;
     in-out property <string> query;
     in-out property <string> board-view: "notes";
     in-out property <string> pending-purge-id: "";
     in-out property <bool> reminder-panel-open: true;
+    in-out property <string> reminder-error;
     callback search(string);
     callback select-board-view(string);
     callback create-note();
@@ -208,11 +228,34 @@ export component BoardWindow inherits Window {
         spacing: 12px;
         HorizontalLayout {
             spacing: 12px;
-            Text { text: "Sticky Notes+"; font-size: 24px; font-weight: 700; color: #25262c; vertical-alignment: center; }
+            Text { text: "Sticky Notes+"; font-size: 24px; font-weight: 700; color: root.board-foreground; vertical-alignment: center; }
             Rectangle { horizontal-stretch: 1; }
-            LineEdit { placeholder-text: "Search your notes"; text <=> query; edited => { root.search(self.text); } width: 230px; }
-            Button { text: root.reminder-panel-open ? "Hide reminders" : "Reminders"; clicked => { root.reminder-panel-open = !root.reminder-panel-open; } }
             Button { text: "+ New note"; primary: true; clicked => { root.create-note(); } }
+            Button { text: "Settings"; clicked => { root.settings-open = !root.settings-open; root.setting-dark = root.dark-theme; } }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            LineEdit { placeholder-text: "Search your notes"; text <=> query; edited => { root.search(self.text); } horizontal-stretch: 1; min-width: 0px; }
+            Button { text: root.reminder-panel-open ? "Hide reminders" : "Reminders"; clicked => { root.reminder-panel-open = !root.reminder-panel-open; } }
+        }
+        if root.settings-open: VerticalLayout {
+            spacing: 6px;
+            HorizontalLayout {
+                CheckBox { text: "Dark appearance"; checked <=> root.setting-dark; }
+                CheckBox { text: "Start with Windows"; checked <=> root.setting-startup; }
+            }
+            HorizontalLayout {
+                Text { text: "New-note shortcut"; color: root.board-foreground; vertical-alignment: center; }
+                LineEdit { text <=> root.setting-shortcut; placeholder-text: "Ctrl+Alt+N"; horizontal-stretch: 1; min-width: 0px; }
+                Button { text: "Apply"; clicked => { root.apply-settings(); } }
+            }
+            Text { text: root.settings-status == "" ? "Startup is opt-in. Shortcut changes apply next launch." : root.settings-status; color: root.board-muted; wrap: word-wrap; }
+            HorizontalLayout {
+                Button { text: "Import Tauri notes…"; clicked => { root.preview-import(); } }
+                Button { visible: root.import-pending; text: "Confirm import"; clicked => { root.confirm-import(); } }
+                Button { visible: root.import-pending; text: "Cancel"; clicked => { root.cancel-import(); } }
+            }
+            Text { visible: root.import-status != ""; text: root.import-status; color: root.board-muted; wrap: word-wrap; }
         }
         HorizontalLayout {
             spacing: 7px;
@@ -222,15 +265,19 @@ export component BoardWindow inherits Window {
             Rectangle { horizontal-stretch: 1; }
             Text {
                 text: root.board-view == "notes" ? notes.length + " active notes" : root.board-view == "archive" ? "Archived notes — reminders still run" : "Deleted notes stay recoverable until removed forever";
-                color: #737887;
+                color: root.board-muted;
                 font-size: 12px;
                 vertical-alignment: center;
             }
         }
         Rectangle { height: 1px; background: #dfe2ea; }
+        if root.reminder-error != "": HorizontalLayout {
+            Text { text: root.reminder-error; color: #ab2e26; wrap: word-wrap; horizontal-stretch: 1; }
+            Button { text: "Dismiss"; clicked => { root.reminder-error = ""; } }
+        }
         Rectangle {
             visible: root.reminder-panel-open && due-reminders.length > 0;
-            height: 116px;
+            height: root.settings-open ? 80px : 116px;
             background: #fff7d6;
             border-width: 1px;
             border-color: #d8bc63;
@@ -260,7 +307,8 @@ export component BoardWindow inherits Window {
                             spacing: 6px;
                             Text {
                                 text: reminder.title == "" ? "Untitled note" : reminder.title;
-                                width: 130px;
+                                color: #66521b;
+                                width: 90px;
                                 font-size: 12px;
                                 font-weight: 700;
                                 overflow: elide;
@@ -274,8 +322,8 @@ export component BoardWindow inherits Window {
                                 overflow: elide;
                                 vertical-alignment: center;
                             }
-                            Button { text: "Mark done"; clicked => { root.complete-reminder(reminder.id); } }
-                            Button { text: "Snooze 10m"; clicked => { root.snooze-reminder(reminder.id); } }
+                            Button { text: "Done"; clicked => { root.complete-reminder(reminder.id); } }
+                            Button { text: "10m"; clicked => { root.snooze-reminder(reminder.id); } }
                             Button { text: "Dismiss"; clicked => { root.dismiss-reminder(reminder.id); } }
                         }
                     }
@@ -317,15 +365,15 @@ export component BoardWindow inherits Window {
                 horizontal-stretch: 1;
                 min-width: 0px;
                 height: 142px;
-                padding: 14px;
                 TouchArea { enabled: root.board-view != "deleted"; clicked => { root.open-note(card.id); } }
                 VerticalLayout {
+                    padding: 12px;
                     spacing: 8px;
                     HorizontalLayout {
-                        Text { text: card.title; font-size: 17px; font-weight: 700; overflow: elide; horizontal-stretch: 1; }
+                        Text { text: card.title; color: card.color == #6F7078 ? #f5f5f6 : #32343d; font-size: 17px; font-weight: 700; overflow: elide; horizontal-stretch: 1; }
                         Text { text: card.pinned ? "★" : "☆"; font-size: 18px; color: #6f5bb8; }
                     }
-                    Text { text: card.preview == "" ? "Empty note" : card.preview; color: #454854; vertical-stretch: 1; overflow: elide; wrap: word-wrap; }
+                    Text { text: card.preview == "" ? "Empty note" : card.preview; color: card.color == #6F7078 ? #e0e1e4 : #454854; font-size: 13px; vertical-stretch: 1; overflow: elide; wrap: word-wrap; min-width: 0px; }
                     HorizontalLayout {
                         spacing: 5px;
                         Button { visible: root.board-view == "notes"; text: card.pinned ? "Unpin" : "Pin"; clicked => { root.toggle-pin(card.id, !card.pinned); } }
@@ -343,7 +391,7 @@ export component BoardWindow inherits Window {
             }
             }
         }
-        Text { text: notes.length == 0 ? root.board-view == "notes" ? "No notes yet. Create one to keep a thought close at hand." : root.board-view == "archive" ? "Your archive is empty. Archived notes can always return to Notes." : "Nothing is in Deleted notes. Deleted notes can be restored here." : root.board-view == "deleted" ? "Restore a note, or permanently delete it when you are certain." : "Open a note to edit it. Changes save automatically on this device."; color: #656a76; horizontal-alignment: center; }
+        Text { text: notes.length == 0 ? root.board-view == "notes" ? "No notes yet. Create one to keep a thought close at hand." : root.board-view == "archive" ? "Your archive is empty. Archived notes can always return to Notes." : "Nothing is in Deleted notes. Deleted notes can be restored here." : root.board-view == "deleted" ? "Restore a note, or permanently delete it when you are certain." : "Open a note to edit it. Changes save automatically on this device."; color: root.board-muted; horizontal-alignment: center; }
     }
 }
 
@@ -409,10 +457,20 @@ export component NoteWindow inherits Window {
     property <bool> overflow-open: false;
     in-out property <string> format-status;
     in-out property <string> save-status;
+    in-out property <image> attachment-preview;
+    in-out property <string> attachment-id;
+    in-out property <string> attachment-caption;
+    in-out property <int> attachment-index: 0;
+    in-out property <int> attachment-count: 0;
+    in-out property <bool> attachment-remove-pending: false;
+    callback add-image();
+    callback browse-image(int);
+    callback remove-image();
     callback save(string, bool, string);
     callback create-note();
     callback close-note();
     callback open-board();
+    callback return-to-board();
     callback choose-color(string);
     callback insert-date-chip();
     callback toggle-date-panel();
@@ -494,7 +552,7 @@ export component NoteWindow inherits Window {
                     vertical-alignment: center;
                     overflow: elide;
                 }
-                Button { visible: header-hit.has-hover || root.overflow-open; text: "⋯"; width: 30px; clicked => { root.overflow-open = !root.overflow-open; root.set-native-editor-visible(!root.overflow-open); if (root.overflow-open) { menu-keyboard.focus(); } } }
+                Button { visible: header-hit.has-hover || root.overflow-open; text: "..."; width: 30px; clicked => { root.overflow-open = !root.overflow-open; root.set-native-editor-visible(!root.overflow-open); if (root.overflow-open) { menu-keyboard.focus(); } } }
                 Button { visible: header-hit.has-hover || root.overflow-open; text: "×"; width: 28px; clicked => { root.close-note(); } }
                 }
             }
@@ -556,6 +614,28 @@ export component NoteWindow inherits Window {
                 }
             }
         }
+        if root.attachment-count > 0: Rectangle {
+            height: min(110px, max(36px, root.content-height / 4));
+            background: #ffffff55;
+            border-radius: 6px;
+            HorizontalLayout {
+                padding: 4px;
+                spacing: 4px;
+                Image { source: root.attachment-preview; image-fit: contain; width: 70px; }
+                VerticalLayout {
+                    Text { height: 18px; text: root.attachment-caption; color: root.note-foreground; overflow: elide; font-size: 11px; min-width: 0px; }
+                    HorizontalLayout {
+                        height: 28px;
+                        spacing: 2px;
+                        Button { visible: !root.attachment-remove-pending; text: "‹"; min-width: 0px; preferred-width: 24px; enabled: root.attachment-count > 1; clicked => { root.browse-image(-1); } }
+                        Button { visible: !root.attachment-remove-pending; text: "›"; min-width: 0px; preferred-width: 24px; enabled: root.attachment-count > 1; clicked => { root.browse-image(1); } }
+                        Button { text: root.attachment-remove-pending ? "Delete" : "Remove"; min-width: 0px; clicked => { if (root.attachment-remove-pending) { root.remove-image(); } else { root.attachment-remove-pending = true; } } }
+                        Button { visible: root.attachment-remove-pending; text: "×"; min-width: 0px; preferred-width: 24px; clicked => { root.attachment-remove-pending = false; } }
+                    }
+                    Rectangle { vertical-stretch: 1; }
+                }
+            }
+        }
         Text {
             visible: root.format-status != "";
             text: root.format-status;
@@ -588,11 +668,12 @@ export component NoteWindow inherits Window {
             }
             HorizontalLayout {
                 spacing: 4px;
-                Button { text: "• List"; clicked => { editor-input.apply-list("bullet"); } }
-                Button { text: "☐ Task"; clicked => { editor-input.apply-list("checklist"); } }
-                Button { text: "＋ date"; clicked => { root.toggle-date-panel(); } }
-                Button { visible: root.native-editor-active; text: "Undo"; width: 42px; clicked => { root.editor-history-action(false); } }
-                Button { visible: root.native-editor-active; text: "Redo"; width: 42px; clicked => { root.editor-history-action(true); } }
+                Button { text: "•"; min-width: 0px; preferred-width: 26px; clicked => { editor-input.apply-list("bullet"); } }
+                Button { text: "☐"; min-width: 0px; preferred-width: 26px; clicked => { editor-input.apply-list("checklist"); } }
+                Button { text: "Date"; min-width: 0px; preferred-width: 38px; clicked => { root.toggle-date-panel(); } }
+                Button { text: "Image"; min-width: 0px; preferred-width: 44px; clicked => { root.add-image(); } }
+                Button { visible: root.native-editor-active; text: "Undo"; min-width: 0px; preferred-width: 38px; clicked => { root.editor-history-action(false); } }
+                Button { visible: root.native-editor-active; text: "Redo"; min-width: 0px; preferred-width: 38px; clicked => { root.editor-history-action(true); } }
                 Rectangle { horizontal-stretch: 1; }
             }
             }
@@ -615,7 +696,7 @@ export component NoteWindow inherits Window {
             x: 0px;
             y: 0px;
             width: parent.width;
-            height: min(146px, parent.height);
+            height: min(178px, parent.height);
             background: #fffdf8;
             border-width: 1px;
             border-color: #00000024;
@@ -635,6 +716,7 @@ export component NoteWindow inherits Window {
                 }
                 Rectangle { height: 1px; background: #dedbd4; }
                 Button { text: "Notes list"; clicked => { root.open-board(); root.overflow-open = false; root.set-native-editor-visible(true); } }
+                Button { text: "Return to notes list"; clicked => { root.return-to-board(); root.overflow-open = false; root.set-native-editor-visible(true); } }
                 Button { text: note-always-on-top ? "Remove from top" : "Keep on top"; clicked => { root.toggle-always-on-top(); root.overflow-open = false; root.set-native-editor-visible(true); } }
                 Button { text: "Delete note"; clicked => { root.delete-note(); root.overflow-open = false; root.set-native-editor-visible(true); } }
             }

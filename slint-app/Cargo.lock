@@ -4155,6 +4155,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "i-slint-backend-winit",
+ "image 0.24.9",
  "raw-window-handle",
  "rusqlite",
  "serde",

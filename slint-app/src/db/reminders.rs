@@ -323,6 +323,45 @@ pub fn snooze(conn: &Connection, id: &str, until: DateTime<Utc>) -> rusqlite::Re
     }
 }
 
+/// A notification is valid only for the pending occurrence that was announced.
+/// Serialize validation and mutation so duplicate/stale toast clicks cannot
+/// advance a recurring reminder twice or act on a deleted note.
+pub fn activate(
+    conn: &Connection,
+    activation: &crate::notification::Activation,
+    as_of: DateTime<Local>,
+) -> rusqlite::Result<Option<String>> {
+    use crate::notification::Action;
+    let transaction = conn.unchecked_transaction()?;
+    let note_id: Option<String> = transaction
+        .query_row(
+            "SELECT r.note_id FROM reminders r JOIN notes n ON n.id=r.note_id
+         WHERE r.id=?1 AND n.deleted_at IS NULL AND r.status='pending'
+         AND r.scheduled_date || 'T' || r.due_time=?2 AND r.notified_for=?2",
+            params![activation.reminder_id, activation.occurrence],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if note_id.is_some() {
+        match activation.action {
+            Action::Open => (),
+            Action::Snooze => snooze(
+                &transaction,
+                &activation.reminder_id,
+                as_of.with_timezone(&Utc) + chrono::Duration::minutes(10),
+            )?,
+            Action::Done => {
+                set_status_at(&transaction, &activation.reminder_id, "completed", as_of)?
+            }
+            Action::Dismiss => {
+                set_status_at(&transaction, &activation.reminder_id, "dismissed", as_of)?
+            }
+        }
+    }
+    transaction.commit()?;
+    Ok(note_id)
+}
+
 pub fn set_status(conn: &Connection, reminder_id: &str, status: &str) -> rusqlite::Result<()> {
     set_status_at(conn, reminder_id, status, Local::now())
 }
@@ -422,6 +461,70 @@ mod tests {
             "blocks": [{"type":"text", "runs": chips.iter().map(|(id,date)| serde_json::json!({"type":"dateChip", "attrs":{"chipId":id,"date":date,"label":date}})).collect::<Vec<_>>() }],
             "plain": "dates"
         }).to_string()
+    }
+
+    #[test]
+    fn toast_actions_are_occurrence_scoped_and_duplicate_done_is_harmless() {
+        use crate::notification::{Action, Activation};
+        let d = db();
+        let content = serde_json::json!({"blocks":[{"type":"text","runs":[{"type":"dateChip","attrs":{"chipId":"c","date":"2026-10-01","time":"09:00","recurrence":"daily"}}]}],"plain":"meeting"}).to_string();
+        notes::create(&d.conn, "n", &content, "#FFF9B1").unwrap();
+        let at = Local
+            .with_ymd_and_hms(2026, 10, 1, 9, 0, 0)
+            .single()
+            .unwrap();
+        let row = due_at(&d.conn, at).unwrap().remove(0);
+        let mut action = Activation {
+            action: Action::Done,
+            reminder_id: row.id.clone(),
+            occurrence: occurrence_key(&row),
+        };
+        assert_eq!(activate(&d.conn, &action, at).unwrap(), None); // Never announced.
+        mark_announced(&d.conn, &row).unwrap();
+        action.occurrence = "2026-09-30T09:00".into();
+        assert_eq!(activate(&d.conn, &action, at).unwrap(), None);
+        action.occurrence = occurrence_key(&row);
+        assert_eq!(
+            activate(&d.conn, &action, at).unwrap().as_deref(),
+            Some("n")
+        );
+        assert_eq!(activate(&d.conn, &action, at).unwrap(), None);
+        assert_eq!(
+            list_for_note(&d.conn, "n").unwrap()[0].scheduled_date,
+            "2026-10-02"
+        );
+    }
+
+    #[test]
+    fn toast_snooze_replay_and_deleted_note_activation_are_ignored() {
+        use crate::notification::{Action, Activation};
+        let d = db();
+        notes::create(&d.conn, "n", &content(&[("c", "2026-10-01")]), "#FFF9B1").unwrap();
+        let at = Local
+            .with_ymd_and_hms(2026, 10, 1, 9, 0, 0)
+            .single()
+            .unwrap();
+        let row = due_at(&d.conn, at).unwrap().remove(0);
+        mark_announced(&d.conn, &row).unwrap();
+        let action = Activation {
+            action: Action::Snooze,
+            reminder_id: row.id.clone(),
+            occurrence: occurrence_key(&row),
+        };
+        assert_eq!(
+            activate(&d.conn, &action, at).unwrap().as_deref(),
+            Some("n")
+        );
+        assert_eq!(
+            activate(&d.conn, &action, at + chrono::Duration::minutes(1)).unwrap(),
+            None
+        );
+        assert_eq!(
+            list_for_note(&d.conn, "n").unwrap()[0].snoozed_until,
+            Some((at.with_timezone(&Utc) + chrono::Duration::minutes(10)).to_rfc3339())
+        );
+        notes::soft_delete(&d.conn, "n").unwrap();
+        assert_eq!(activate(&d.conn, &action, at).unwrap(), None);
     }
 
     #[test]

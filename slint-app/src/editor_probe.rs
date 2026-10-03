@@ -1,6 +1,6 @@
 //! Explicit, isolated release probe. Never opens the production database.
 use crate::*;
-use std::{fs::OpenOptions, io::Write, mem::size_of, time::Instant};
+use std::{cell::Cell, fs::OpenOptions, io::Write, mem::size_of, time::Instant};
 use windows_sys::Win32::{
     Foundation::FILETIME,
     System::{
@@ -51,6 +51,163 @@ const PHASES: [(&str, f64); 4] = [
     ("typing", 8.0),
     ("settle", 4.0),
 ];
+
+const SOAK_PHASES: [(&str, f64); 4] = [
+    ("warmup", 8.0),
+    ("idle", 30.0),
+    ("typing", 60.0),
+    ("settle", 30.0),
+];
+
+/// Real native return/close/reopen lifecycle, isolated from production data.
+pub fn window_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<_> = std::env::args().collect();
+    if args.len() != 3 {
+        return Err("Usage: --window-probe <new-report.json>".into());
+    }
+    let mut report = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&args[2])?;
+    let sandbox = PathBuf::from(&args[2]).with_extension("sandbox");
+    std::fs::create_dir(&sandbox)?;
+    std::env::set_var("STICKY_NOTES_ENABLE_RICHEDIT", "1");
+    let db = Arc::new(Mutex::new(Db::open_in_dir(&sandbox)?));
+    let source = "Return café 😀 [[date:2026-10-01T17:30]]";
+    notes::create(
+        &db.lock().unwrap().conn,
+        "roundtrip",
+        &content_for_editor_with_checklists_and_formats(source, false, &FormatRanges::default()),
+        "#FFF9B1",
+    )?;
+    let board = BoardWindow::new()?;
+    board.set_dark_theme(true);
+    board.set_settings_open(true);
+    let windows = Rc::new(RefCell::new(Vec::<EditorEntry>::new()));
+    let initial_ids = crate::native_projection::content_ids(
+        &notes::get(&db.lock().unwrap().conn, "roundtrip")?
+            .unwrap()
+            .content,
+    );
+    open_editor(&board, &db, "roundtrip", &windows);
+    let phase = Rc::new(Cell::new(0));
+    let cycles = Rc::new(Cell::new(0));
+    let failure = Rc::new(RefCell::new(None::<String>));
+    let geometry = Rc::new(Cell::new(None::<WindowGeometry>));
+    let timer = Timer::default();
+    {
+        let db = db.clone();
+        let windows = windows.clone();
+        let board = board.clone_strong();
+        let phase = phase.clone();
+        let cycles = cycles.clone();
+        let failure = failure.clone();
+        let geometry = geometry.clone();
+        timer.start(TimerMode::Repeated, Duration::from_millis(300), move || {
+            let result = (|| -> anyhow::Result<()> {
+                match phase.get() {
+                    0 => {
+                        let entries = windows.borrow();
+                        let entry = &entries[0];
+                        entry.window.window().set_size(PhysicalSize::new(470, 440));
+                        let native = entry
+                            .native_editor
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("No native editor"))?;
+                        native.restore_selection(source, source.len(), source.len());
+                        native.inject_probe_character('.');
+                    }
+                    1 => {
+                        let window = windows.borrow()[0].window.clone_strong();
+                        geometry.set(Some(WindowGeometry::from_window(&window.window())));
+                        window.invoke_return_to_board();
+                        anyhow::ensure!(
+                            !window.window().is_visible() && board.window().is_visible(),
+                            "Return did not hide note/show board"
+                        );
+                        let guard = db.lock().unwrap();
+                        let note = notes::get(&guard.conn, "roundtrip")?.unwrap();
+                        anyhow::ensure!(!note.is_floating, "Returned note remains floating");
+                        anyhow::ensure!(
+                            editor_state_from_content_with_checklists(&note.content).0
+                                == format!("{source}."),
+                            "Pending input lost during return"
+                        );
+                        anyhow::ensure!(
+                            crate::native_projection::content_ids(&note.content) == initial_ids,
+                            "Return changed chip IDs"
+                        );
+                    }
+                    2 => {
+                        windows
+                            .borrow_mut()
+                            .retain(|entry| entry.window.window().is_visible());
+                        anyhow::ensure!(windows.borrow().is_empty(), "Hidden host retained");
+                        open_editor(&board, &db, "roundtrip", &windows);
+                    }
+                    3 => {
+                        let entries = windows.borrow();
+                        let entry = &entries[0];
+                        anyhow::ensure!(
+                            entry.window.get_editor_text().as_str() == format!("{source}."),
+                            "Reopen lost saved input"
+                        );
+                        anyhow::ensure!(
+                            WindowGeometry::from_window(&entry.window.window())
+                                == geometry.get().unwrap(),
+                            "Reopen changed geometry"
+                        );
+                        anyhow::ensure!(
+                            notes::get(&db.lock().unwrap().conn, "roundtrip")?
+                                .unwrap()
+                                .is_floating,
+                            "Reopen did not detach"
+                        );
+                        entry.window.invoke_close_note();
+                        anyhow::ensure!(
+                            !entry.window.window().is_visible(),
+                            "Close did not hide note"
+                        );
+                        cycles.set(cycles.get() + 1);
+                    }
+                    _ => {
+                        windows
+                            .borrow_mut()
+                            .retain(|entry| entry.window.window().is_visible());
+                        anyhow::ensure!(windows.borrow().is_empty(), "Closed host retained");
+                        anyhow::ensure!(
+                            !notes::get(&db.lock().unwrap().conn, "roundtrip")?
+                                .unwrap()
+                                .is_floating,
+                            "Closed note will restore unexpectedly"
+                        );
+                        if cycles.get() < 20 {
+                            phase.set(1);
+                        } else {
+                            let _ = slint::quit_event_loop();
+                        }
+                    }
+                }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                *failure.borrow_mut() = Some(error.to_string());
+                let _ = slint::quit_event_loop();
+            }
+            phase.set(phase.get() + 1);
+        });
+    }
+    slint::run_event_loop_until_quit()?;
+    timer.stop();
+    if let Some(error) = failure.borrow_mut().take() {
+        return Err(error.into());
+    }
+    if phase.get() != 5 {
+        return Err("Window probe interrupted".into());
+    }
+    report.write_all(serde_json::to_string_pretty(&serde_json::json!({"return_to_board":true,"reopened_geometry":true,"pending_native_input_saved":true,"chip_ids_preserved":true,"hidden_hosts_released":true,"close_clears_floating":true,"reopen_close_cycles":cycles.get(),"database":"isolated file-backed SQLite"}))?.as_bytes())?;
+    Ok(())
+}
 
 /// Human/computer-use acceptance sandbox; production data and shortcuts are
 /// untouched. Reopen only a directory explicitly marked by this mode.
@@ -169,8 +326,10 @@ pub fn preview() -> Result<(), Box<dyn std::error::Error>> {
         let windows = windows.clone();
         let db = db.clone();
         geometry_timer.start(TimerMode::Repeated, Duration::from_millis(250), move || {
+            let mut entries = windows.borrow_mut();
+            entries.retain(|entry| entry.window.window().is_visible());
             let guard = db.lock().unwrap();
-            for entry in windows.borrow_mut().iter_mut() {
+            for entry in entries.iter_mut() {
                 if let Some(native) = &entry.native_editor {
                     let [width, height] = native.client_size();
                     entry.window.set_native_client_width(width);
@@ -208,8 +367,14 @@ pub fn preview() -> Result<(), Box<dyn std::error::Error>> {
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 4 || !matches!(args[2].as_str(), "1" | "20") {
-        return Err("Usage: --editor-probe <1|20> <new-report.json>".into());
+        return Err(
+            "Usage: --editor-probe, --editor-soak or --attachment-probe <1|20> <new-report.json>"
+                .into(),
+        );
     }
+    let soak = args[1] == "--editor-soak";
+    let with_images = args[1] == "--attachment-probe";
+    let phases = if soak { SOAK_PHASES } else { PHASES };
     let count: usize = args[2].parse()?;
     // Refuse to overwrite an existing report. The production database is never
     // opened, and there is no tray/hotkey registration in this isolated mode.
@@ -223,7 +388,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let db = Arc::new(Mutex::new(Db::open_in_dir(&sandbox)?));
     let board = BoardWindow::new()?;
     let windows = Rc::new(RefCell::new(Vec::<EditorEntry>::new()));
-    let source = "Editable 😀 note\n[ ] Follow up [[date:2026-09-27]]\nNative mixed formatting and Unicode café.\n".repeat(4);
+    let source = "Editable 😀 note\n[ ] Follow up [[date:2026-09-27]]\nNative mixed formatting and Unicode café.\n".repeat(if soak { 64 } else { 4 });
     let content = content_for_editor_with_checklists_and_formats(
         &source,
         false,
@@ -234,11 +399,24 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             strike: vec![(0, 4)],
         },
     );
+    let image_source = sandbox.join("probe-image.png");
+    if with_images {
+        // Generate locally; no downloaded image or production note is used.
+        image::RgbaImage::from_fn(1600, 1200, |x, y| {
+            image::Rgba([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8, 255])
+        })
+        .save(&image_source)?;
+    }
     for index in 0..count {
         let id = format!("probe-{index}");
         {
             let guard = db.lock().unwrap();
             notes::create(&guard.conn, &id, &content, "#FFF9B1")?;
+            if with_images {
+                for _ in 0..3 {
+                    crate::db::attachments::import_image(&guard.conn, &id, &image_source)?;
+                }
+            }
             notes::save_window_geom(
                 &guard.conn,
                 &id,
@@ -259,6 +437,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("Probe could not create all native editors; no valid measurement".into());
     }
+    let expected_chip_ids = crate::native_projection::content_ids(
+        &notes::get(&db.lock().unwrap().conn, "probe-0")?
+            .unwrap()
+            .content,
+    );
     let processors = std::thread::available_parallelism()?.get();
     let phase = Rc::new(RefCell::new(0usize));
     let injected = Rc::new(RefCell::new(0usize));
@@ -285,15 +468,15 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             let index = *phase.borrow();
-            if index >= PHASES.len() {
+            if index >= phases.len() {
                 return;
             }
             peak_working_set = peak_working_set.max(current.working_set_mib);
             let elapsed = started.elapsed().as_secs_f64();
-            if elapsed >= PHASES[index].1 {
+            if elapsed >= phases[index].1 {
                 let cpu = current.cpu_seconds - baseline.cpu_seconds;
                 results.borrow_mut().push(serde_json::json!({
-                    "phase": PHASES[index].0, "elapsed_seconds": elapsed,
+                    "phase": phases[index].0, "elapsed_seconds": elapsed,
                     "cpu_seconds": cpu, "cpu_percent_one_core": cpu / elapsed * 100.0,
                     "cpu_percent_machine": cpu / elapsed * 100.0 / processors as f64,
                     "working_set_mib": current.working_set_mib,
@@ -309,7 +492,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 started = Instant::now();
                 peak_working_set = current.working_set_mib;
                 baseline = current;
-                if index + 1 == PHASES.len() {
+                println!("Completed {} phase", phases[index].0);
+                if index + 1 == phases.len() {
                     let _ = slint::quit_event_loop();
                 }
                 return;
@@ -330,6 +514,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             if index == 2 {
+                if with_images && *injected.borrow() % 10 == 0 {
+                    // Exercise the actual preview callback once a second.
+                    for entry in editors.iter() { entry.window.invoke_browse_image(1); }
+                }
                 editors[0]
                     .native_editor
                     .as_ref()
@@ -344,16 +532,30 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(error) = failures.borrow_mut().take() {
         return Err(error.into());
     }
-    if *phase.borrow() != PHASES.len() {
+    if *phase.borrow() != phases.len() {
         return Err("Probe interrupted before completion".into());
     }
     // Verify debounce reached disk before any explicit close/save flush.
     let expected = format!("{source}{}", ".".repeat(*injected.borrow()));
     let disk = Db::open_in_dir(&sandbox)?;
+    if with_images {
+        for entry in windows.borrow().iter() {
+            let images = crate::db::attachments::list(&disk.conn, &entry.id)?;
+            if images.len() != 3 || entry.window.get_attachment_count() != 3 {
+                return Err("Attachment count changed during editing".into());
+            }
+            for item in images {
+                crate::db::attachments::thumbnail(&disk.conn, &item.id)?;
+            }
+        }
+    }
     let autosaved = notes::get(&disk.conn, "probe-0")?.unwrap();
     let (autosaved_text, _, _) = editor_state_from_content_with_checklists(&autosaved.content);
     if autosaved_text != expected {
         return Err("Disk autosave did not persist input before final flush".into());
+    }
+    if crate::native_projection::content_ids(&autosaved.content) != expected_chip_ids {
+        return Err("Disk autosave changed native chip identities".into());
     }
     let mut saved = true;
     for entry in windows.borrow().iter() {
@@ -367,7 +569,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     let persisted = notes::get(&db.lock().unwrap().conn, "probe-0")?.unwrap();
     let (actual, _, _) = editor_state_from_content_with_checklists(&persisted.content);
-    if !saved || actual != expected {
+    if !saved
+        || actual != expected
+        || crate::native_projection::content_ids(&persisted.content) != expected_chip_ids
+    {
         return Err("Probe input did not persist correctly".into());
     }
     let payload = serde_json::json!({
@@ -378,7 +583,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         "typing_workload": "10 ASCII characters/second in one note, real WM_CHAR, normal snapshot/autosave",
         "database": "isolated file-backed SQLite WAL; no production data",
         "disk_autosave_verified_before_flush": true,
-        "limitations": "No tray/hotkey timers; overlapping notes; synthetic input is not IME/visual acceptance; short run is not a soak test",
+        "chip_identity_verified": true, "extended_workload": soak,
+        "attachments_per_note": if with_images { 3 } else { 0 },
+        "image_dimensions": if with_images { "1600x1200 PNG" } else { "none" },
+        "preview_workload": if with_images { "one 320x240 maximum preview per note; browse every note once/second during typing" } else { "none" },
+        "attachment_persistence_verified": with_images,
+        "limitations": "No tray/hotkey timers; overlapping notes; synthetic input is not IME/visual acceptance; bounded run is not a long-duration leak test",
         "persisted_input_verified": true, "phases": &*results.borrow(),
     });
     report.write_all(serde_json::to_string_pretty(&payload)?.as_bytes())?;

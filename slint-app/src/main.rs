@@ -7,15 +7,20 @@ mod editor_history;
 #[cfg(windows)]
 mod editor_probe;
 mod hotkey;
+mod image_picker;
+#[cfg(windows)]
+mod instance;
 mod native_projection;
 #[cfg(windows)]
 mod native_rich_editor;
+mod notification;
+mod settings;
 mod tray;
 
 slint::include_modules!();
 
 use chrono::{Datelike, Local, NaiveDate};
-use db::{notes, reminders, Db};
+use db::{attachments, notes, reminders, Db};
 use slint::{
     CloseRequestResponse, ComponentHandle, Model, ModelRc, PhysicalPosition, PhysicalSize, Timer,
     TimerMode, VecModel,
@@ -1444,6 +1449,38 @@ fn flush_editor(
     }
 }
 
+fn prepare_editor_close(
+    db: &Arc<Mutex<Db>>,
+    note_id: &str,
+    editor: &NoteWindow,
+    state: &Rc<RefCell<EditorSaveState>>,
+    board: &slint::Weak<BoardWindow>,
+) -> bool {
+    if !flush_editor(db, note_id, editor, state, board) {
+        return false;
+    }
+    let geometry = WindowGeometry::from_window(&editor.window());
+    let result = notes::save_window_geom(
+        &db.lock().unwrap().conn,
+        note_id,
+        f64::from(geometry.x),
+        f64::from(geometry.y),
+        f64::from(geometry.width),
+        f64::from(geometry.height),
+        false,
+    );
+    match result {
+        Ok(()) => {
+            state.borrow().timer.stop();
+            true
+        }
+        Err(error) => {
+            editor.set_save_status(format!("Couldn't close; note stays open ({error})").into());
+            false
+        }
+    }
+}
+
 fn schedule_autosave(
     state: &Rc<RefCell<EditorSaveState>>,
     db: Arc<Mutex<Db>>,
@@ -1535,15 +1572,41 @@ fn visible_notes(db: &Arc<Mutex<Db>>, query: &str, board_view: &str) -> Vec<note
     }
 }
 
+fn floating_note_ids(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<String>> {
+    Ok(notes::list(conn, true, false, None)?
+        .into_iter()
+        .filter(|note| note.is_floating && !note.is_archived)
+        .map(|note| note.id)
+        .collect())
+}
+
+fn note_preview(plain: &str, title: Option<&str>) -> String {
+    let mut lines = plain
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .peekable();
+    if lines.peek().is_some_and(|line| Some(line.trim()) == title) {
+        lines.next();
+    }
+    lines
+        .flat_map(str::split_whitespace)
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(240)
+        .collect()
+}
+
 fn refresh(board: &BoardWindow, db: &Arc<Mutex<Db>>, query: &str) {
     let cards = visible_notes(db, query, &board.get_board_view())
         .into_iter()
         .map(|note| {
             let plain = plain_from_content(&note.content);
+            let preview = note_preview(&plain, note.title.as_deref());
             NoteCard {
                 id: note.id.into(),
                 title: note.title.unwrap_or_else(|| "Untitled note".into()).into(),
-                preview: plain.into(),
+                preview: preview.into(),
                 color: color(&note.color),
                 pinned: note.is_pinned,
             }
@@ -1653,21 +1716,59 @@ fn surface_unannounced_due(board: &BoardWindow, db: &Arc<Mutex<Db>>) {
         return;
     }
     refresh_due_reminders(board, db);
-    board.set_reminder_panel_open(true);
-    if board.show().is_ok() {
+    let mut fallback = Vec::new();
+    {
         let guard = db.lock().expect("database lock poisoned");
         for row in rows {
-            let _ = reminders::mark_announced(&guard.conn, &row);
+            let mut delivered = false;
+            #[cfg(windows)]
+            {
+                let title = notes::get(&guard.conn, &row.note_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|note| note.title)
+                    .unwrap_or_default();
+                match notification::show(&row, &title) {
+                    Ok(shown) => delivered = shown,
+                    Err(error) => eprintln!("Windows reminder delivery unavailable: {error}"),
+                }
+            }
+            if delivered {
+                let _ = reminders::mark_announced(&guard.conn, &row);
+            } else {
+                fallback.push(row);
+            }
+        }
+    }
+    if !fallback.is_empty() {
+        board.set_reminder_panel_open(true);
+        if board.show().is_ok() {
+            let guard = db.lock().expect("database lock poisoned");
+            for row in fallback {
+                let _ = reminders::mark_announced(&guard.conn, &row);
+            }
         }
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Installer-owned uninstall action: no UI, note DB or activation inbox.
+    if std::env::args().nth(1).as_deref() == Some("--remove-startup") {
+        settings::set_windows_startup(false)?;
+        return Ok(());
+    }
     if std::env::var_os("SLINT_BACKEND").is_none() {
         std::env::set_var("SLINT_BACKEND", "winit-software");
     }
     #[cfg(windows)]
-    if std::env::args().nth(1).as_deref() == Some("--editor-probe") {
+    if std::env::args().nth(1).as_deref() == Some("--window-probe") {
+        return editor_probe::window_roundtrip();
+    }
+    #[cfg(windows)]
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("--editor-probe" | "--editor-soak" | "--attachment-probe")
+    ) {
         return editor_probe::run();
     }
     #[cfg(windows)]
@@ -1677,14 +1778,202 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ) {
         return editor_probe::preview();
     }
+    let background_launch = std::env::args().nth(1).as_deref() == Some("--background");
+    #[cfg(windows)]
+    let instance = {
+        let args: Vec<_> = std::env::args().collect();
+        let command = if args.get(1).map(String::as_str) == Some("--activate") {
+            if args.len() != 3 || notification::Activation::parse(&args[2]).is_none() {
+                return Err("Invalid reminder activation".into());
+            }
+            instance::Command::Notification(args[2].clone())
+        } else if background_launch {
+            instance::Command::Background
+        } else {
+            instance::Command::ShowBoard
+        };
+        let Some(owner) = instance::Instance::start(&app_data_dir(), command)? else {
+            return Ok(());
+        };
+        owner
+    };
     let db = Arc::new(Mutex::new(Db::open_in_dir(&app_data_dir())?));
+    // Recover files left by a crash between file creation and metadata commit.
+    // The primary instance owns the database and imports share this mutex.
+    let attachment_cleanup_error = attachments::cleanup_orphans(&db.lock().unwrap().conn)
+        .err()
+        .map(|error| format!("Image cleanup needs retry: {error}"));
     let board = BoardWindow::new()?;
+    let (preferences, settings_error) = match settings::load(&db.lock().unwrap().conn) {
+        Ok(preferences) => (preferences, String::new()),
+        Err(error) => (
+            settings::Preferences::default(),
+            format!("Could not load settings: {error}. Existing settings were preserved."),
+        ),
+    };
+    board.set_dark_theme(preferences.dark_theme);
+    board.set_setting_dark(preferences.dark_theme);
+    board.set_setting_shortcut(preferences.shortcut.clone().into());
+    board.set_setting_startup(preferences.start_with_windows);
+    board.set_settings_status(settings_error.into());
+    let pending_import = Rc::new(RefCell::new(None::<db::import::ImportPlan>));
+    {
+        let weak = board.as_weak();
+        let db = db.clone();
+        let pending = pending_import.clone();
+        board.on_preview_import(move || {
+            let Some(board) = weak.upgrade() else { return; };
+            pending.borrow_mut().take();
+            board.set_import_pending(false);
+            let result = image_picker::select_database(&board.window()).and_then(|path| {
+                let Some(path) = path else { return Ok(()); };
+                let guard = db.lock().unwrap();
+                let plan = db::import::preview(&path, &guard.conn)?;
+                let conflicts = plan.conflicts(&guard.conn)?;
+                board.set_import_status(format!("{}: {} notes, {} existing IDs skipped. Dates become local minute-level schedules. A database backup is made before import; imported windows stay closed.", plan.source.display(), plan.count(), conflicts).into());
+                *pending.borrow_mut() = Some(plan);
+                board.set_import_pending(true);
+                Ok(())
+            });
+            if let Err(error) = result { board.set_import_status(format!("Import cancelled: {error}").into()); }
+        });
+    }
+    {
+        let weak = board.as_weak();
+        let db = db.clone();
+        let pending = pending_import.clone();
+        board.on_confirm_import(move || {
+            let Some(board) = weak.upgrade() else {
+                return;
+            };
+            let Some(plan) = pending.borrow_mut().take() else {
+                return;
+            };
+            board.set_import_pending(false);
+            let result = db::import::apply(&db.lock().unwrap().conn, &plan);
+            match result {
+                Ok((count, backup)) => {
+                    board.set_import_status(
+                        format!("Imported {count} notes. Backup: {}", backup.display()).into(),
+                    );
+                    refresh(&board, &db, board.get_query().as_str());
+                    refresh_due_reminders(&board, &db);
+                }
+                Err(error) => board
+                    .set_import_status(format!("Import failed; no notes imported: {error}").into()),
+            }
+        });
+    }
+    {
+        let weak = board.as_weak();
+        let pending = pending_import.clone();
+        board.on_cancel_import(move || {
+            pending.borrow_mut().take();
+            if let Some(board) = weak.upgrade() {
+                board.set_import_pending(false);
+                board.set_import_status("Import cancelled.".into());
+            }
+        });
+    }
+    if let Some(error) = attachment_cleanup_error {
+        board.set_settings_status(error.into());
+    }
+    let preferences = Rc::new(RefCell::new(preferences));
+    {
+        let weak = board.as_weak();
+        let db = db.clone();
+        let preferences = preferences.clone();
+        board.on_apply_settings(move || {
+            let Some(board) = weak.upgrade() else {
+                return;
+            };
+            let next = settings::Preferences {
+                dark_theme: board.get_setting_dark(),
+                shortcut: board.get_setting_shortcut().trim().into(),
+                start_with_windows: board.get_setting_startup(),
+                ..settings::Preferences::default()
+            };
+            let result = settings::apply(
+                &db.lock().unwrap().conn,
+                &preferences.borrow(),
+                &next,
+                settings::set_windows_startup,
+            );
+            match result {
+                Ok(()) => {
+                    board.set_dark_theme(next.dark_theme);
+                    *preferences.borrow_mut() = next;
+                    board.set_settings_status("Saved. Shortcut changes apply next launch.".into());
+                }
+                Err(error) => {
+                    board.set_settings_status(format!("Settings not applied: {error}").into())
+                }
+            }
+        });
+    }
     let board_weak = board.as_weak();
     let editor_windows: Rc<RefCell<Vec<EditorEntry>>> = Rc::new(RefCell::new(Vec::new()));
     refresh(&board, &db, "");
     // Evaluate immediately rather than making the user wait for the first
     // timer tick after launch.
     refresh_due_reminders(&board, &db);
+
+    #[cfg(windows)]
+    let activation_timer = Timer::default();
+    #[cfg(windows)]
+    {
+        let weak = board.as_weak();
+        let db = db.clone();
+        let windows = editor_windows.clone();
+        activation_timer.start(TimerMode::Repeated, Duration::from_millis(100), move || {
+            let Some(board) = weak.upgrade() else {
+                return;
+            };
+            let commands = match instance.poll() {
+                Ok(commands) => commands,
+                Err(error) => {
+                    eprintln!("Activation inbox unavailable: {error}");
+                    return;
+                }
+            };
+            for command in commands {
+                match command {
+                    instance::Command::Background => (),
+                    instance::Command::ShowBoard => {
+                        refresh_due_reminders(&board, &db);
+                        let _ = board.show();
+                        board.window().with_winit_window(|host| host.focus_window());
+                    }
+                    instance::Command::Notification(uri) => {
+                        let Some(activation) = notification::Activation::parse(&uri) else {
+                            continue;
+                        };
+                        let result = reminders::activate(
+                            &db.lock().unwrap().conn,
+                            &activation,
+                            Local::now(),
+                        );
+                        match result {
+                            Ok(Some(note_id)) => {
+                                if activation.action == notification::Action::Open {
+                                    open_editor(&board, &db, &note_id, &windows);
+                                }
+                                refresh_due_reminders(&board, &db);
+                                let _ = board.show();
+                            }
+                            Ok(None) => (), // Stale notification: never alter a newer occurrence.
+                            Err(error) => {
+                                board.set_reminder_error(
+                                    format!("Could not apply reminder action: {error}").into(),
+                                );
+                                let _ = board.show();
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // The projection is date based, so a modest UI-loop poll is enough to
     // cover day rollover and an app left open overnight without introducing a
@@ -1711,6 +2000,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let windows = editor_windows.clone();
         geometry_timer.start(TimerMode::Repeated, Duration::from_millis(250), move || {
             let mut windows = windows.borrow_mut();
+            // Release hidden note hosts outside their close callbacks. Native
+            // child procedures must not be destroyed while dispatching an event.
+            windows.retain(|entry| entry.window.window().is_visible());
             let guard = db.lock().unwrap();
             for entry in windows.iter_mut() {
                 if let Some(native) = &entry.native_editor {
@@ -1964,7 +2256,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let id = id.to_string();
             let purged = {
                 let guard = db.lock().expect("database lock poisoned");
-                notes::purge(&guard.conn, &id).is_ok()
+                let purged = notes::purge(&guard.conn, &id).is_ok();
+                if purged {
+                    if let Err(error) = attachments::cleanup_orphans(&guard.conn) {
+                        if let Some(board) = weak.upgrade() {
+                            board.set_settings_status(
+                                format!("Note deleted; image cleanup needs retry: {error}").into(),
+                            );
+                        }
+                    }
+                }
+                purged
             };
             if let Some(board) = weak.upgrade() {
                 board.set_pending_purge_id("".into());
@@ -2028,6 +2330,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
+    let has_tray = cfg!(windows) && tray.is_some();
     let tray_timer = Timer::default();
     {
         let db = db.clone();
@@ -2075,12 +2378,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The native registration thread never touches Slint. It only forwards
     // WM_HOTKEY events to this timer, so creating a note remains on Slint's
     // UI event loop just like the board and tray actions do.
-    let quick_create = match hotkey::QuickCreate::register_default() {
+    let shortcut = preferences.borrow().shortcut.clone();
+    let quick_create = match hotkey::QuickCreate::register(&shortcut) {
         Ok(hotkey) => Some(hotkey),
         Err(error) => {
+            board.set_settings_status(
+                format!("Shortcut {shortcut} could not be registered: {error}").into(),
+            );
             eprintln!(
                 "global quick-create shortcut ({}) unavailable; continuing without it: {error}",
-                hotkey::DEFAULT_SHORTCUT
+                shortcut
             );
             None
         }
@@ -2099,10 +2406,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
-    board.show()?;
+    if !background_launch || !has_tray {
+        board.show()?;
+    }
+    let restore_ids = floating_note_ids(&db.lock().unwrap().conn)?;
+    for id in restore_ids {
+        open_editor(&board, &db, &id, &editor_windows);
+    }
     surface_unannounced_due(&board, &db);
-    slint::run_event_loop()?;
+    if has_tray {
+        // Hiding the last window must not disable reminders, activation or
+        // the tray. Explicit Quit flushes notes before terminating the app.
+        slint::run_event_loop_until_quit()?;
+    } else {
+        slint::run_event_loop()?;
+    }
     Ok(())
+}
+
+fn sync_attachments(editor: &NoteWindow, conn: &rusqlite::Connection, id: &str, index: i32) {
+    editor.set_attachment_remove_pending(false);
+    match attachments::list(conn, id) {
+        Ok(items) => {
+            editor.set_attachment_count(items.len() as i32);
+            editor.set_attachment_preview(slint::Image::default());
+            editor.set_attachment_id("".into());
+            if items.is_empty() {
+                editor.set_attachment_caption("".into());
+                return;
+            }
+            let index = index.rem_euclid(items.len() as i32);
+            editor.set_attachment_index(index);
+            let item = &items[index as usize];
+            editor.set_attachment_id(item.id.clone().into());
+            editor.set_attachment_caption(
+                format!("{} / {} · {}", index + 1, items.len(), item.name).into(),
+            );
+            match attachments::thumbnail(conn, &item.id) {
+                Ok(image) => editor.set_attachment_preview(image),
+                Err(error) => {
+                    editor.set_format_status(format!("Image preview unavailable: {error}").into())
+                }
+            }
+        }
+        Err(error) => editor.set_format_status(format!("Couldn't load images: {error}").into()),
+    }
 }
 
 fn open_editor(
@@ -2115,6 +2463,12 @@ fn open_editor(
     // board reopened from a note focus the existing native window instead of
     // creating duplicate editors for the same note.
     if let Some(entry) = windows.borrow().iter().find(|entry| entry.id == id) {
+        sync_attachments(
+            &entry.window,
+            &db.lock().unwrap().conn,
+            id,
+            entry.window.get_attachment_index(),
+        );
         // Hidden Slint windows can retain a stale scene/model snapshot. Reload
         // all persisted properties before showing a reused editor, then ask the
         // backend for an explicit redraw (otherwise hover can be the first event
@@ -2131,6 +2485,16 @@ fn open_editor(
             }
         }
         let _ = entry.window.show();
+        let geometry = WindowGeometry::from_window(&entry.window.window());
+        let _ = notes::save_window_geom(
+            &db.lock().unwrap().conn,
+            id,
+            f64::from(geometry.x),
+            f64::from(geometry.y),
+            f64::from(geometry.width),
+            f64::from(geometry.height),
+            true,
+        );
         entry.window.window().request_redraw();
         return;
     }
@@ -2146,6 +2510,7 @@ fn open_editor(
         Err(_) => return,
     };
     sync_editor_presentation(&editor, &note);
+    sync_attachments(&editor, &db.lock().unwrap().conn, id, 0);
     if let Some(geometry) = WindowGeometry::from_db(note.window) {
         geometry.apply(&editor.window());
     }
@@ -2201,6 +2566,67 @@ fn open_editor(
             );
         }
     });
+    {
+        let weak = weak_editor.clone();
+        let db = db.clone();
+        let id = id.to_owned();
+        let state = save_state.clone();
+        let board = weak_board.clone();
+        editor.on_add_image(move || {
+            let Some(window) = weak.upgrade() else {
+                return;
+            };
+            window.invoke_dismiss_date_panel();
+            if !flush_editor(&db, &id, &window, &state, &board) {
+                return;
+            }
+            let result = image_picker::select(&window.window()).and_then(|path| {
+                if let Some(path) = path {
+                    let guard = db.lock().unwrap();
+                    attachments::import_image(&guard.conn, &id, &path)?;
+                    let count = attachments::list(&guard.conn, &id)?.len() as i32;
+                    sync_attachments(&window, &guard.conn, &id, count - 1);
+                    window.set_format_status("Image saved locally.".into());
+                }
+                Ok(())
+            });
+            if let Err(error) = result {
+                window.set_format_status(format!("Couldn't add image: {error}").into());
+            }
+        });
+    }
+    {
+        let weak = weak_editor.clone();
+        let db = db.clone();
+        let id = id.to_owned();
+        editor.on_browse_image(move |direction| {
+            if let Some(window) = weak.upgrade() {
+                sync_attachments(
+                    &window,
+                    &db.lock().unwrap().conn,
+                    &id,
+                    window.get_attachment_index() + direction,
+                );
+            }
+        });
+    }
+    {
+        let weak = weak_editor.clone();
+        let db = db.clone();
+        let id = id.to_owned();
+        editor.on_remove_image(move || {
+            if let Some(window) = weak.upgrade() {
+                let guard = db.lock().unwrap();
+                let result =
+                    attachments::remove(&guard.conn, &id, window.get_attachment_id().as_str());
+                sync_attachments(&window, &guard.conn, &id, window.get_attachment_index());
+                window.set_format_status(match result {
+                    Ok(()) => "Image removed.".into(),
+                    Err(error) => format!("Image cleanup needs retry: {error}").into(),
+                });
+            }
+        });
+    }
     let weak_close = weak_editor.clone();
     let weak_close_board = weak_board.clone();
     let db_close = db.clone();
@@ -2208,7 +2634,7 @@ fn open_editor(
     let save_state_for_close = save_state.clone();
     editor.on_close_note(move || {
         if let Some(window) = weak_close.upgrade() {
-            if flush_editor(
+            if prepare_editor_close(
                 &db_close,
                 &close_id,
                 &window,
@@ -2226,7 +2652,7 @@ fn open_editor(
     let save_state_for_native_close = save_state.clone();
     editor.window().on_close_requested(move || {
         if let Some(window) = weak_native_close.upgrade() {
-            if flush_editor(
+            if prepare_editor_close(
                 &db_native_close,
                 &native_close_id,
                 &window,
@@ -2247,6 +2673,31 @@ fn open_editor(
         if let Some(board) = weak_board_button.upgrade() {
             refresh_due_reminders(&board, &db_open_board);
             let _ = board.show();
+        }
+    });
+    let weak_return = editor.as_weak();
+    let weak_return_board = board.as_weak();
+    let db_return = db.clone();
+    let return_id = id.to_owned();
+    let save_state_return = save_state.clone();
+    editor.on_return_to_board(move || {
+        if let Some(window) = weak_return.upgrade() {
+            if prepare_editor_close(
+                &db_return,
+                &return_id,
+                &window,
+                &save_state_return,
+                &weak_return_board,
+            ) {
+                if window.hide().is_ok() {
+                    if let Some(board) = weak_return_board.upgrade() {
+                        board.set_board_view("notes".into());
+                        board.set_query("".into());
+                        refresh(&board, &db_return, "");
+                        let _ = board.show();
+                    }
+                }
+            }
         }
     });
     let weak_board_new_note = board.as_weak();
@@ -2791,7 +3242,12 @@ fn open_editor(
                             let post_native = Rc::downgrade(&native_for_resize);
                             native_for_resize.repaint_after_parent(move || {
                                 if let (Some(window), Some(native)) = (post_window.upgrade(), post_native.upgrade()) {
-                                    native.set_layout_bounds([window.get_editor_left(), window.get_editor_top(), window.get_editor_width(), window.get_editor_height()]);
+                                    if native.set_layout_bounds([window.get_editor_left(), window.get_editor_top(), window.get_editor_width(), window.get_editor_height()]) {
+                                        // Moving the child changes which parent pixels were
+                                        // clipped in this frame. Render one fresh parent frame
+                                        // to clear the old HWND footprint, not on every poll.
+                                        window.window().request_redraw();
+                                    }
                                 }
                             });
                         }
@@ -2856,6 +3312,41 @@ fn open_editor(
 mod editor_tests {
     use super::*;
     use crate::db::reminders;
+    #[test]
+    fn board_preview_omits_only_an_exact_title_and_bounds_unicode() {
+        assert_eq!(
+            note_preview("Heading\n\n café   😀\nNext", Some("Heading")),
+            "café 😀 Next"
+        );
+        assert_eq!(
+            note_preview("Longer heading\nBody", Some("Longer")),
+            "Longer heading Body"
+        );
+        assert_eq!(note_preview(&"😀".repeat(300), None).chars().count(), 240);
+    }
+
+    #[test]
+    fn restart_restores_only_live_floating_notes_and_retains_returned_geometry() {
+        let directory =
+            std::env::temp_dir().join(format!("sticky-restoration-test-{}", Uuid::new_v4()));
+        let db = Db::open_in_dir(&directory).unwrap();
+        for id in ["open", "closed", "archived", "deleted"] {
+            notes::create(&db.conn, id, EMPTY_CONTENT, "#FFF9B1").unwrap();
+            notes::save_window_geom(&db.conn, id, -120.0, 240.0, 470.0, 440.0, id != "closed")
+                .unwrap();
+        }
+        notes::update_meta(&db.conn, "archived", None, None, Some(true)).unwrap();
+        notes::soft_delete(&db.conn, "deleted").unwrap();
+        drop(db);
+        let db = Db::open_in_dir(&directory).unwrap();
+        assert_eq!(floating_note_ids(&db.conn).unwrap(), vec!["open"]);
+        assert_eq!(
+            notes::get(&db.conn, "closed").unwrap().unwrap().window,
+            Some((-120.0, 240.0, 470.0, 440.0))
+        );
+        notes::save_window_geom(&db.conn, "open", -120.0, 240.0, 470.0, 440.0, false).unwrap();
+        assert!(floating_note_ids(&db.conn).unwrap().is_empty());
+    }
 
     fn reminder_test_db() -> Db {
         let path =

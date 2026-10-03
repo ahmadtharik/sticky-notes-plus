@@ -35,6 +35,7 @@ const EM_SETCHARFORMAT: u32 = 1092;
 const EM_EXGETSEL: u32 = 1076;
 const EM_EXSETSEL: u32 = 1079;
 const EM_REDO: u32 = 1108;
+const EM_REPLACESEL: u32 = 194;
 const SCF_SELECTION: usize = 0x0001;
 const CFM_BOLD: u32 = 0x0000_0001;
 const CFM_ITALIC: u32 = 0x0000_0002;
@@ -530,16 +531,17 @@ impl NativeRichEditor {
     /// Use the actual Slint editor rectangle, expressed in logical pixels.
     /// Cache it so the existing geometry poll does not repaint an unchanged
     /// native child every time it checks note positions.
-    pub fn set_layout_bounds(&self, bounds: [f32; 4]) {
+    pub fn set_layout_bounds(&self, bounds: [f32; 4]) -> bool {
         if bounds.iter().any(|value| !value.is_finite())
             || bounds[2] < 0.0
             || bounds[3] < 0.0
             || self.inner.layout_bounds.get() == Some(bounds)
         {
-            return;
+            return false;
         }
         self.inner.layout_bounds.set(Some(bounds));
         self.layout();
+        true
     }
 
     pub fn set_visible(&self, visible: bool) {
@@ -791,7 +793,12 @@ unsafe extern "system" fn rich_edit_proc(
     };
     let is_delete = message == WM_KEYDOWN && wparam == VK_DELETE as usize;
     let backwards = message == WM_KEYDOWN && wparam == VK_BACK as usize;
-    if matches!(message, WM_CHAR | WM_PASTE | WM_CUT | WM_CLEAR) || is_delete || backwards {
+    if matches!(
+        message,
+        WM_CHAR | WM_PASTE | WM_CUT | WM_CLEAR | EM_REPLACESEL
+    ) || is_delete
+        || backwards
+    {
         let projection = control_projection(hwnd);
         let mut range = selection(hwnd);
         inner.last_edit_at.set(Some(range.cp_min.max(0) as usize));
@@ -819,6 +826,17 @@ unsafe extern "system" fn rich_edit_proc(
             }
         }
         set_selection(hwnd, range);
+        if range.cp_min < range.cp_max {
+            // Replacing selected chip text consumes that chip even if the
+            // replacement happens to spell the same visible date label.
+            inner.tracked_chips.borrow_mut().retain(|tracked| {
+                !projection.chips.iter().any(|chip| {
+                    chip.id == tracked.id
+                        && range.cp_min < chip.control_end as i32
+                        && range.cp_max > chip.control_start as i32
+                })
+            });
+        }
         let mut reset = char_format();
         reset.dw_mask = 0x100 | 0x10 | 0x0400_0000;
         reset.dw_effects = 0x0400_0000;
@@ -833,11 +851,6 @@ unsafe extern "system" fn rich_edit_proc(
             inner.schedule_change();
             return 0;
         }
-    }
-    if message == 194 {
-        inner
-            .last_edit_at
-            .set(Some(selection(hwnd).cp_min.max(0) as usize));
     }
     let result = unsafe { CallWindowProcW(original, hwnd, message, wparam, lparam) };
     if message == WM_LBUTTONUP {
@@ -873,6 +886,7 @@ unsafe extern "system" fn rich_edit_proc(
                 | WM_PASTE
                 | WM_CUT
                 | WM_CLEAR
+                | EM_REPLACESEL
                 | WM_UNDO
                 | EM_REDO
                 | WM_IME_COMPOSITION
@@ -1147,7 +1161,33 @@ unsafe fn control_projection(hwnd: HWND) -> crate::native_projection::Projection
             .map(|pointer| (*(*pointer)).last_edit_at.get())
             .flatten()
     });
-    crate::native_projection::Projection::from_visible_control_with_edit(&raw, &tracked, edit_at)
+    let projection = crate::native_projection::Projection::from_visible_control_with_edit(
+        &raw, &tracked, edit_at,
+    );
+    // TOM includes text inserted exactly at a range boundary. Once the edit
+    // hint identifies the original label, narrow the live range immediately:
+    // a later edit must not reassign its identity to an identical pasted label.
+    EDITORS.with(|editors| {
+        let Some(pointer) = editors.borrow().get(&(hwnd as isize)).copied() else {
+            return;
+        };
+        let inner = &*pointer;
+        inner.tracked_chips.borrow_mut().retain_mut(|chip| {
+            let Some(span) = projection.chips.iter().find(|span| span.id == chip.id) else {
+                return false;
+            };
+            if chip.range.GetStart().ok() == Some(span.control_start as i32)
+                && chip.range.GetEnd().ok() == Some(span.control_end as i32)
+            {
+                return true;
+            }
+            chip.range
+                .SetRange(span.control_start as i32, span.control_end as i32)
+                .is_ok()
+        });
+        inner.last_edit_at.set(None);
+    });
+    projection
 }
 
 unsafe fn document_from_control(hwnd: HWND) -> NativeDocument {
@@ -1157,26 +1197,7 @@ unsafe fn document_from_control(hwnd: HWND) -> NativeDocument {
         chip_ids: projection.ids(),
         ..Default::default()
     };
-    let spans: Vec<_> = document
-        .text
-        .char_indices()
-        .filter_map(|(start, character)| {
-            if projection
-                .chips
-                .iter()
-                .any(|chip| start >= chip.source_start && start < chip.source_end)
-            {
-                return None;
-            }
-            let end = start + character.len_utf8();
-            Some((
-                start,
-                end,
-                projection.to_control(start),
-                projection.to_control(end),
-            ))
-        })
-        .collect();
+    let spans = projection.plain_character_spans();
     // Query homogeneous ranges as a whole, splitting only mixed ranges. A
     // long plain note now needs one format query rather than one per glyph.
     // Preserve the native selection once for the entire snapshot.
@@ -1663,6 +1684,126 @@ mod tests {
     }
 
     #[test]
+    fn chip_identity_survives_a_boundary_paste_followed_by_another_edit() {
+        let _guard = native_test_guard();
+        let parent = TestParent::new();
+        let id = uuid::Uuid::new_v4().to_string();
+        let source = "[[date:2026-09-27]]";
+        let editor = NativeRichEditor::attach_to_parent(
+            parent.0,
+            1.0,
+            NativeDocument {
+                text: source.into(),
+                chip_ids: vec![id.clone()],
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        editor.restore_selection(source, 0, 0);
+        let paste: Vec<_> = " Sep 27 ".encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            SendMessageW(editor.inner.hwnd, 194, 1, paste.as_ptr() as super::LPARAM);
+        }
+        let pasted = editor.document();
+        assert_eq!(pasted.text, " Sep 27 [[date:2026-09-27]]");
+        editor.restore_selection(&pasted.text, pasted.text.len(), pasted.text.len());
+        unsafe {
+            SendMessageW(editor.inner.hwnd, super::WM_CHAR, 'X' as usize, 0);
+        }
+        let edited = editor.document();
+        assert_eq!(edited.text, " Sep 27 [[date:2026-09-27]]X");
+        assert_eq!(edited.chip_ids, vec![id.clone()]);
+        editor.history_action(false);
+        assert_eq!(editor.document().text, source);
+        assert_eq!(editor.document().chip_ids, vec![id]);
+    }
+
+    #[test]
+    fn replacing_a_selected_chip_with_its_label_removes_the_chip_identity() {
+        let _guard = native_test_guard();
+        let parent = TestParent::new();
+        let source = "[[date:2026-09-27]]";
+        let editor = NativeRichEditor::attach_to_parent(
+            parent.0,
+            1.0,
+            NativeDocument {
+                text: source.into(),
+                chip_ids: vec![uuid::Uuid::new_v4().to_string()],
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        editor.restore_selection(source, 0, source.len());
+        let paste: Vec<_> = " Sep 27 ".encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            SendMessageW(
+                editor.inner.hwnd,
+                super::EM_REPLACESEL,
+                1,
+                paste.as_ptr() as super::LPARAM,
+            );
+        }
+        let edited = editor.document();
+        assert_eq!(edited.text, " Sep 27 ");
+        assert!(edited.chip_ids.is_empty());
+        editor.history_action(false);
+        assert_eq!(editor.document().text, source);
+        assert_eq!(editor.document().chip_ids.len(), 1);
+    }
+
+    #[test]
+    fn consecutive_native_replacements_keep_the_original_chip_range() {
+        let _guard = native_test_guard();
+        let parent = TestParent::new();
+        let id = uuid::Uuid::new_v4().to_string();
+        let source = "[[date:2026-09-27]]";
+        let saved = Rc::new(RefCell::new(Vec::new()));
+        let changes = saved.clone();
+        let editor = NativeRichEditor::attach_to_parent(
+            parent.0,
+            1.0,
+            NativeDocument {
+                text: source.into(),
+                chip_ids: vec![id.clone()],
+                ..Default::default()
+            },
+            move |document| changes.borrow_mut().push(document),
+        )
+        .unwrap();
+        editor.restore_selection(source, 0, 0);
+        let paste: Vec<_> = " Sep 27 ".encode_utf16().chain(Some(0)).collect();
+        let suffix: Vec<_> = "Z".encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            SendMessageW(
+                editor.inner.hwnd,
+                super::EM_REPLACESEL,
+                1,
+                paste.as_ptr() as super::LPARAM,
+            );
+            super::set_selection(
+                editor.inner.hwnd,
+                super::CharRange {
+                    cp_min: -1,
+                    cp_max: -1,
+                },
+            );
+            SendMessageW(
+                editor.inner.hwnd,
+                super::EM_REPLACESEL,
+                1,
+                suffix.as_ptr() as super::LPARAM,
+            );
+        }
+        let edited = editor.document();
+        assert_eq!(edited.text, " Sep 27 [[date:2026-09-27]]Z");
+        assert_eq!(edited.chip_ids, vec![id]);
+        editor.flush_pending_change();
+        assert_eq!(saved.borrow().last(), Some(&edited));
+    }
+
+    #[test]
     fn pasted_visible_date_text_does_not_steal_an_existing_chip_id() {
         let _guard = native_test_guard();
         let parent = TestParent::new();
@@ -1759,7 +1900,8 @@ mod tests {
         let editor =
             NativeRichEditor::attach_to_parent(parent.0, 1.0, NativeDocument::default(), |_| {})
                 .unwrap();
-        editor.set_layout_bounds([10.0, 10.0, 200.0, 140.0]);
+        assert!(editor.set_layout_bounds([10.0, 10.0, 200.0, 140.0]));
+        assert!(!editor.set_layout_bounds([10.0, 10.0, 200.0, 140.0]));
         editor.set_layout_bounds([10.0, 10.0, 0.0, 0.0]);
         let mut rect = windows_sys::Win32::Foundation::RECT::default();
         unsafe {

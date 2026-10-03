@@ -141,7 +141,11 @@ impl Projection {
         let mut seen = std::collections::HashSet::new();
         let mut sorted = tracked.to_vec();
         sorted.sort_by_key(|chip| chip.control_start);
+        let control_units = units(control);
         for tracked in sorted {
+            if tracked.control_end <= tracked.control_start || tracked.control_end > control_units {
+                continue;
+            }
             let label = format!(" {} ", crate::date_label(&tracked.date));
             let label_units = units(&label);
             let exact = (tracked.control_end - tracked.control_start == label_units)
@@ -364,6 +368,34 @@ impl Projection {
         self.chips.iter().map(|chip| chip.id.clone()).collect()
     }
 
+    /// Map plain glyphs once, rather than rescanning preceding chips and text
+    /// for both ends of every glyph in a formatting snapshot.
+    pub fn plain_character_spans(&self) -> Vec<(usize, usize, usize, usize)> {
+        let mut spans = Vec::new();
+        let mut source_cursor = 0;
+        let mut control_cursor = 0;
+        for chip in &self.chips {
+            for (offset, character) in self.source[source_cursor..chip.source_start].char_indices()
+            {
+                let start = source_cursor + offset;
+                let end = start + character.len_utf8();
+                let control_end = control_cursor + character.len_utf16();
+                spans.push((start, end, control_cursor, control_end));
+                control_cursor = control_end;
+            }
+            source_cursor = chip.source_end;
+            control_cursor = chip.control_end;
+        }
+        for (offset, character) in self.source[source_cursor..].char_indices() {
+            let start = source_cursor + offset;
+            let end = start + character.len_utf8();
+            let control_end = control_cursor + character.len_utf16();
+            spans.push((start, end, control_cursor, control_end));
+            control_cursor = control_end;
+        }
+        spans
+    }
+
     pub fn to_control(&self, offset: usize) -> usize {
         let mut source_cursor = 0;
         let mut control_cursor = 0;
@@ -419,6 +451,37 @@ fn byte_at_unit(value: &str, target: usize) -> Option<usize> {
 mod tests {
     use super::*;
     #[test]
+    fn linear_glyph_spans_match_point_mapping_with_unicode_and_adjacent_chips() {
+        for source in [
+            "",
+            "😀 café\n日本語",
+            "[[date:2026-09-27]]",
+            "😀[[date:2026-09-27]][[date:2026-09-28]] café\n日本語",
+        ] {
+            let projection = Projection::from_source_visible(source, &[]);
+            let expected: Vec<_> = source
+                .char_indices()
+                .filter_map(|(start, character)| {
+                    if projection
+                        .chips
+                        .iter()
+                        .any(|chip| start >= chip.source_start && start < chip.source_end)
+                    {
+                        return None;
+                    }
+                    let end = start + character.len_utf8();
+                    Some((
+                        start,
+                        end,
+                        projection.to_control(start),
+                        projection.to_control(end),
+                    ))
+                })
+                .collect();
+            assert_eq!(projection.plain_character_spans(), expected);
+        }
+    }
+    #[test]
     fn source_marker_inserted_before_existing_chip_gets_its_own_identity() {
         let existing = Projection::from_source("[[date:2026-09-27T17:30]]", &[]);
         let p =
@@ -465,6 +528,24 @@ mod tests {
         assert!(!projection.control.contains(id));
         assert!(!projection.control.contains("[[chip:"));
         assert!(projection.control.contains("Sep 27"));
+    }
+
+    #[test]
+    fn invalid_live_ranges_remain_plain_text_without_panicking() {
+        let control = "😀 Sep 27 ";
+        for (start, end) in [(8, 2), (2, 2), (1, 9), (2, usize::MAX)] {
+            let restored = Projection::from_visible_control(
+                control,
+                &[TrackedChip {
+                    control_start: start,
+                    control_end: end,
+                    id: Uuid::new_v4().to_string(),
+                    date: "2026-09-27".into(),
+                }],
+            );
+            assert_eq!(restored.source, control);
+            assert!(restored.chips.is_empty());
+        }
     }
 
     #[test]

@@ -1,0 +1,49 @@
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Sticky Notes+" Manufacturer="Sticky Notes Plus" Version="0.1.0"
+           UpgradeCode="953ECAB2-473D-4D44-85F8-75A8E49DB2B2" Scope="perUser">
+    <MajorUpgrade DowngradeErrorMessage="A newer Sticky Notes+ version is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="Sticky Notes Plus">
+          <Component Id="Application" Guid="1DB44AD7-0D39-43BB-97C2-DF74E491620A">
+            <File Id="StickyExe" Source="$(var.SourceDir)\sticky-notes-plus-slint.exe" />
+            <RegistryValue Root="HKCU" Key="Software\StickyNotesPlus" Name="InstalledPath" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes" />
+          </Component>
+          <Component Id="IdentityMarker" Guid="22B38337-482B-4A26-8DF0-FA640F42A26F">
+            <File Id="NotificationIdentity" Source="$(var.IdentityFile)" />
+            <RegistryValue Root="HKCU" Key="Software\StickyNotesPlus" Name="NotificationIdentity" Type="string" Value="StickyNotesPlus.Native" KeyPath="yes" />
+          </Component>
+          <Component Id="Protocol" Guid="6D0DD517-F59F-4B9D-A0D3-77E09514C39A">
+            <RegistryValue Root="HKCU" Key="Software\Classes\sticky-notes-plus" Type="string" Value="URL:Sticky Notes Plus Reminder" KeyPath="yes" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\sticky-notes-plus" Name="URL Protocol" Type="string" Value="" />
+            <RegistryValue Root="HKCU" Key="Software\Classes\sticky-notes-plus\shell\open\command" Type="string" Value="&quot;[#StickyExe]&quot; --activate &quot;%1&quot;" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="StartShortcut" Guid="194A4834-91A2-4CB0-A145-9409606FC42A">
+        <Shortcut Id="StartMenuShortcut" Name="Sticky Notes+" Target="[#StickyExe]" WorkingDirectory="INSTALLFOLDER">
+          <ShortcutProperty Key="System.AppUserModel.ID" Value="StickyNotesPlus.Native" />
+          <!-- Protocol-only activation: stub CLSID enables Action Center persistence;
+               deliberately no COM server is registered for this GUID. -->
+          <ShortcutProperty Key="System.AppUserModel.ToastActivatorCLSID" Value="{825593D6-1B38-4F1D-919D-3A04273E6AB0}" />
+        </Shortcut>
+        <RegistryValue Root="HKCU" Key="Software\StickyNotesPlus" Name="ShortcutInstalled" Type="integer" Value="1" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+    <Feature Id="Main" Title="Sticky Notes+" Level="1">
+      <ComponentRef Id="Application" />
+      <ComponentRef Id="IdentityMarker" />
+      <ComponentRef Id="Protocol" />
+      <ComponentRef Id="StartShortcut" />
+    </Feature>
+    <!-- Only remove our value, never the shared Windows Run key. Skip major
+         upgrade removal so an existing user's startup preference survives. -->
+    <CustomAction Id="RemoveStartup" FileRef="StickyExe" ExeCommand="--remove-startup" Execute="deferred" Impersonate="yes" Return="check" />
+    <InstallExecuteSequence>
+      <Custom Action="RemoveStartup" Before="RemoveFiles" Condition="REMOVE~=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

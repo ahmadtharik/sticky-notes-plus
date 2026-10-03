@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-pub const CURRENT: i64 = 4;
+pub const CURRENT: i64 = 5;
 
 const INITIAL: &str = include_str!("../../schema/001_initial.sql");
 
@@ -92,6 +92,18 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<i64> {
     tx.execute_batch(
         "CREATE INDEX IF NOT EXISTS reminders_schedule_idx
          ON reminders(status, scheduled_date, due_time, snoozed_until);",
+    )?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS attachments (
+            id TEXT PRIMARY KEY,
+            note_id TEXT NOT NULL REFERENCES notes(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            mime TEXT NOT NULL,
+            bytes INTEGER NOT NULL,
+            width INTEGER NOT NULL,
+            height INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS attachments_note_idx ON attachments(note_id);",
     )?;
     tx.execute(
         "INSERT INTO meta(key,value) VALUES ('schema_version',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
