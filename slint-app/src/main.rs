@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod checklist_presentation;
 mod content_identity;
 mod date_picker;
 mod db;
@@ -14,8 +15,12 @@ mod native_projection;
 #[cfg(windows)]
 mod native_rich_editor;
 mod notification;
+#[cfg(windows)]
+mod reliability_probe;
 mod settings;
 mod tray;
+#[cfg(windows)]
+mod window_chrome;
 
 slint::include_modules!();
 
@@ -1543,7 +1548,25 @@ fn set_bold_for_phrase(
     }
     Some((serialize_bold_ranges(&next_ranges), matches.len()))
 }
+fn paper_hex(value: &str) -> &str {
+    match value {
+        "#FFF9B1" => "#fff8ce",
+        "#D9F7BE" => "#e2f6d8",
+        "#FFD7E5" | "#FFD6E7" => "#fce3ef",
+        "#E6D8FF" | "#E4D7FF" => "#eee2fa",
+        "#DCE8FF" => "#ddf2fc",
+        "#E9E9E9" => "#f1f1f1",
+        "#6F7078" => "#454545",
+        _ => value,
+    }
+}
 fn color(value: &str) -> slint::Color {
+    let value = paper_hex(value);
+    let value = if value.len() == 7 && value.starts_with('#') && value.is_ascii() {
+        value
+    } else {
+        "#fff8ce"
+    };
     slint::Color::from_argb_u8(
         255,
         u8::from_str_radix(&value[1..3], 16).unwrap_or(255),
@@ -1589,9 +1612,9 @@ fn note_preview(plain: &str, title: Option<&str>) -> String {
         lines.next();
     }
     lines
-        .flat_map(str::split_whitespace)
+        .map(|line| line.split_whitespace().collect::<Vec<_>>().join(" "))
         .collect::<Vec<_>>()
-        .join(" ")
+        .join("\n")
         .chars()
         .take(240)
         .collect()
@@ -1603,12 +1626,23 @@ fn refresh(board: &BoardWindow, db: &Arc<Mutex<Db>>, query: &str) {
         .map(|note| {
             let plain = plain_from_content(&note.content);
             let preview = note_preview(&plain, note.title.as_deref());
+            let modified = chrono::DateTime::parse_from_rfc3339(&note.modified_at)
+                .ok()
+                .map(|time| time.with_timezone(&Local).date_naive());
+            let today = Local::now().date_naive();
+            let updated_label = match modified {
+                Some(date) if date == today => "Today".to_owned(),
+                Some(date) if Some(date) == today.pred_opt() => "Yesterday".to_owned(),
+                Some(date) => date.format("%b %d").to_string(),
+                None => String::new(),
+            };
             NoteCard {
                 id: note.id.into(),
                 title: note.title.unwrap_or_else(|| "Untitled note".into()).into(),
                 preview: preview.into(),
                 color: color(&note.color),
                 pinned: note.is_pinned,
+                updated_label: updated_label.into(),
             }
         })
         .collect::<Vec<_>>();
@@ -1752,6 +1786,14 @@ fn surface_unannounced_due(board: &BoardWindow, db: &Arc<Mutex<Db>>) {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("--reliability-probe" | "--crash-fixture")
+    ) {
+        reliability_probe::run()?;
+        return Ok(());
+    }
     // Installer-owned uninstall action: no UI, note DB or activation inbox.
     if std::env::args().nth(1).as_deref() == Some("--remove-startup") {
         settings::set_windows_startup(false)?;
@@ -2005,6 +2047,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             windows.retain(|entry| entry.window.window().is_visible());
             let guard = db.lock().unwrap();
             for entry in windows.iter_mut() {
+                #[cfg(windows)]
+                window_chrome::update_hover(&entry.window);
                 if let Some(native) = &entry.native_editor {
                     let [width, height] = native.client_size();
                     entry.window.set_native_client_width(width);
@@ -2509,6 +2553,8 @@ fn open_editor(
         Ok(window) => window,
         Err(_) => return,
     };
+    #[cfg(windows)]
+    editor.set_frameless(true);
     sync_editor_presentation(&editor, &note);
     sync_attachments(&editor, &db.lock().unwrap().conn, id, 0);
     if let Some(geometry) = WindowGeometry::from_db(note.window) {
@@ -2625,6 +2671,36 @@ fn open_editor(
                     Err(error) => format!("Image cleanup needs retry: {error}").into(),
                 });
             }
+        });
+    }
+    #[cfg(windows)]
+    {
+        let drag_origin = Rc::new(RefCell::new(None));
+        let weak = weak_editor.clone();
+        let origin = drag_origin.clone();
+        editor.on_begin_drag(move || {
+            if let (Some(window), Some(cursor)) = (weak.upgrade(), window_chrome::cursor_position())
+            {
+                let geometry = WindowGeometry::from_window(window.window());
+                *origin.borrow_mut() =
+                    Some((PhysicalPosition::new(geometry.x, geometry.y), cursor));
+            }
+        });
+        let weak = weak_editor.clone();
+        let origin = drag_origin.clone();
+        editor.on_move_drag(move || {
+            if let (Some(window), Some((position, start)), Some(cursor)) = (
+                weak.upgrade(),
+                *origin.borrow(),
+                window_chrome::cursor_position(),
+            ) {
+                window
+                    .window()
+                    .set_position(window_chrome::dragged_position(position, start, cursor));
+            }
+        });
+        editor.on_end_drag(move || {
+            *drag_origin.borrow_mut() = None;
         });
     }
     let weak_close = weak_editor.clone();
@@ -3137,7 +3213,13 @@ fn open_editor(
             );
             #[cfg(windows)]
             if let Some(native) = native_for_checklist.borrow().as_ref() {
+                let (start, end) = native.selection_byte_offsets(&source);
                 native.set_document(&native_document_from_editor(&window));
+                native.restore_selection(
+                    &window.get_editor_text(),
+                    start.max(0) as usize,
+                    end.max(0) as usize,
+                );
             }
             remember_editor_text(
                 &save_state_for_checklist,
@@ -3209,6 +3291,12 @@ fn open_editor(
                 Ok(native) => {
                     let native = Rc::new(native);
                     let clicked_window = editor.as_weak();
+                    let checkbox_window = editor.as_weak();
+                    native.on_checklist_clicked(move |line, checked| {
+                        if let Some(window) = checkbox_window.upgrade() {
+                            window.invoke_toggle_checklist(line, checked);
+                        }
+                    });
                     let clicked_native = Rc::downgrade(&native);
                     native.on_chip_clicked(move |occurrence, x, y| {
                         if let Some(window) = clicked_window.upgrade() {
@@ -3316,11 +3404,11 @@ mod editor_tests {
     fn board_preview_omits_only_an_exact_title_and_bounds_unicode() {
         assert_eq!(
             note_preview("Heading\n\n café   😀\nNext", Some("Heading")),
-            "café 😀 Next"
+            "café 😀\nNext"
         );
         assert_eq!(
             note_preview("Longer heading\nBody", Some("Longer")),
-            "Longer heading Body"
+            "Longer heading\nBody"
         );
         assert_eq!(note_preview(&"😀".repeat(300), None).chars().count(), 240);
     }

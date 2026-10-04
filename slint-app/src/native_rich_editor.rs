@@ -122,11 +122,14 @@ struct Inner {
     metrics: Cell<NativeMetrics>,
     history: RefCell<crate::editor_history::History<NativeDocument>>,
     chip_clicked: RefCell<Option<Box<dyn FnMut(i32, f32, f32)>>>,
+    checklist_clicked: RefCell<Option<Box<dyn FnMut(i32, bool)>>>,
+    mouse_down: Cell<Option<(i16, i16)>>,
     composing: Cell<bool>,
     handled_enter: Cell<bool>,
     palette: Cell<Option<u32>>,
     text_document: Option<ITextDocument>,
     tracked_chips: RefCell<Vec<TrackedNativeChip>>,
+    task_styles: RefCell<Vec<(ITextRange, bool)>>,
     last_edit_at: Cell<Option<usize>>,
 }
 
@@ -193,6 +196,9 @@ pub struct NativeRichEditor {
 }
 
 impl NativeRichEditor {
+    pub fn on_checklist_clicked(&self, callback: impl FnMut(i32, bool) + 'static) {
+        *self.inner.checklist_clicked.borrow_mut() = Some(Box::new(callback));
+    }
     pub fn attach(
         window: &slint::Window,
         document: NativeDocument,
@@ -289,11 +295,14 @@ impl NativeRichEditor {
                 document_weight,
             )),
             chip_clicked: RefCell::new(None),
+            checklist_clicked: RefCell::new(None),
+            mouse_down: Cell::new(None),
             composing: Cell::new(false),
             handled_enter: Cell::new(false),
             palette: Cell::new(None),
             text_document: Some(text_document),
             tracked_chips: RefCell::new(Vec::new()),
+            task_styles: RefCell::new(Vec::new()),
             last_edit_at: Cell::new(None),
         });
         *inner.weak_self.borrow_mut() = Rc::downgrade(&inner);
@@ -401,6 +410,7 @@ impl NativeRichEditor {
     }
 
     pub fn set_palette(&self, value: &str) {
+        let value = crate::paper_hex(value);
         self.inner.repaint_needed.set(true);
         let Ok(rgb) = u32::from_str_radix(value.trim_start_matches('#'), 16) else {
             return;
@@ -473,6 +483,7 @@ impl NativeRichEditor {
         if selection.cp_min >= selection.cp_max {
             return Err("Select text before applying a style.".into());
         }
+        unsafe { clear_task_styles(hwnd) };
         let mut format = char_format();
         unsafe {
             SendMessageW(
@@ -683,7 +694,28 @@ unsafe extern "system" fn rich_edit_proc(
         return 0;
     };
     let original = unsafe { (*pointer).original_proc.get() };
+    if message == windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONDOWN {
+        (*pointer).mouse_down.set(Some((
+            (lparam as u32 & 0xffff) as i16,
+            ((lparam as u32 >> 16) & 0xffff) as i16,
+        )));
+    }
     let inner = &*pointer;
+    // Remove presentation-only effects before RichEdit changes text or starts
+    // an IME composition, so insertion never inherits a completed-task strike.
+    if !inner.suppress_change.get()
+        && matches!(
+            message,
+            WM_CHAR
+                | WM_PASTE
+                | WM_CUT
+                | WM_CLEAR
+                | EM_REPLACESEL
+                | windows_sys::Win32::UI::WindowsAndMessaging::WM_IME_STARTCOMPOSITION
+        )
+    {
+        clear_task_styles(hwnd);
+    }
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION,
     };
@@ -856,6 +888,26 @@ unsafe extern "system" fn rich_edit_proc(
     if message == WM_LBUTTONUP {
         let projection = control_projection(hwnd);
         let point = selection(hwnd).cp_min.max(0) as usize;
+        let mouse = (
+            (lparam as u32 & 0xffff) as i16,
+            ((lparam as u32 >> 16) & 0xffff) as i16,
+        );
+        let click = inner.mouse_down.take().is_some_and(|down| {
+            let threshold = 4.0 * inner.scale_factor.get();
+            f32::from(mouse.0.abs_diff(down.0)) <= threshold
+                && f32::from(mouse.1.abs_diff(down.1)) <= threshold
+        });
+        if click && selection(hwnd).cp_min == selection(hwnd).cp_max {
+            if let Some((line, checked)) = crate::checklist_presentation::target(
+                &projection.source,
+                projection.to_source(point),
+            ) {
+                if let Some(callback) = inner.checklist_clicked.borrow_mut().as_mut() {
+                    callback(line, checked);
+                }
+                return result;
+            }
+        }
         if let Some((index, chip)) = projection
             .chips
             .iter()
@@ -961,12 +1013,14 @@ unsafe fn set_selection(hwnd: HWND, range: CharRange) {
 }
 
 unsafe fn set_document(hwnd: HWND, document: &NativeDocument) {
+    clear_task_styles(hwnd);
     let _redraw = RedrawBatch::new(hwnd);
     let projection = crate::native_projection::Projection::from_source_visible(
         &document.text,
         &document.chip_ids,
     );
-    let control_text = projection.control.replace('\n', "\r\n");
+    let control_text =
+        crate::checklist_presentation::render(&projection.control).replace('\n', "\r\n");
     let mut wide: Vec<u16> = control_text.encode_utf16().collect();
     wide.push(0);
     SendMessageW(hwnd, WM_SETTEXT, 0, wide.as_ptr() as LPARAM);
@@ -1028,6 +1082,7 @@ unsafe fn set_document(hwnd: HWND, document: &NativeDocument) {
     if let Some(rgb) = palette {
         apply_palette(hwnd, rgb);
     }
+    style_completed_tasks(hwnd, document, &projection);
     set_selection(
         hwnd,
         CharRange {
@@ -1087,6 +1142,7 @@ unsafe fn text_object_document(hwnd: HWND) -> Option<ITextDocument> {
 }
 
 unsafe fn apply_palette(hwnd: HWND, rgb: u32) {
+    clear_task_styles(hwnd);
     let previous = selection(hwnd);
     let _redraw = RedrawBatch::new(hwnd);
     let colorref = ((rgb >> 16) & 255) | (rgb & 0xff00) | ((rgb & 255) << 16);
@@ -1100,12 +1156,12 @@ unsafe fn apply_palette(hwnd: HWND, rgb: u32) {
     );
     let mut format = char_format();
     format.dw_mask = 0x4000_0000 | 0x2000_0000 | 0x8000_0000;
-    format.cr_text_color = if rgb == 0x6f7078 {
+    format.cr_text_color = if rgb == 0x6f7078 || rgb == 0x454545 {
         0x00f6f5f5
     } else {
         0x003d3432
     };
-    format.y_height = 220;
+    format.y_height = 210;
     for (index, unit) in "Segoe UI".encode_utf16().enumerate() {
         format.sz_face_name[index] = unit;
     }
@@ -1117,6 +1173,7 @@ unsafe fn apply_palette(hwnd: HWND, rgb: u32) {
     );
     style_chips(hwnd, &control_projection(hwnd));
     set_selection(hwnd, previous);
+    let _ = document_from_control(hwnd);
 }
 
 unsafe fn control_projection(hwnd: HWND) -> crate::native_projection::Projection {
@@ -1132,7 +1189,9 @@ unsafe fn control_projection(hwnd: HWND) -> crate::native_projection::Projection
         .iter()
         .position(|&unit| unit == 0)
         .unwrap_or(buffer.len());
-    let raw = String::from_utf16_lossy(&buffer[..end]).replace("\r\n", "\n");
+    let raw = crate::checklist_presentation::restore(
+        &String::from_utf16_lossy(&buffer[..end]).replace("\r\n", "\n"),
+    );
     let tracked = EDITORS.with(|editors| {
         let Some(pointer) = editors.borrow().get(&(hwnd as isize)).copied() else {
             return Vec::new();
@@ -1191,6 +1250,7 @@ unsafe fn control_projection(hwnd: HWND) -> crate::native_projection::Projection
 }
 
 unsafe fn document_from_control(hwnd: HWND) -> NativeDocument {
+    clear_task_styles(hwnd);
     let projection = control_projection(hwnd);
     let mut document = NativeDocument {
         text: projection.source.clone(),
@@ -1230,7 +1290,118 @@ unsafe fn document_from_control(hwnd: HWND) -> NativeDocument {
             },
         );
     }
+    style_completed_tasks(hwnd, &document, &projection);
     document
+}
+
+/// Presentation ranges retain their actual user strike state. They are removed
+/// before snapshots/input and rebuilt afterwards, never serialized as styles.
+unsafe fn clear_task_styles(hwnd: HWND) {
+    let pointer = EDITORS.with(|editors| editors.borrow().get(&(hwnd as isize)).copied());
+    let Some(pointer) = pointer else { return };
+    let inner = &*pointer;
+    let ranges = std::mem::take(&mut *inner.task_styles.borrow_mut());
+    if ranges.is_empty() {
+        return;
+    }
+    let previous = selection(hwnd);
+    let suppress = inner.suppress_change.replace(true);
+    let _redraw = RedrawBatch::new(hwnd);
+    for (range, struck) in ranges {
+        let (Ok(start), Ok(end)) = (range.GetStart(), range.GetEnd()) else {
+            continue;
+        };
+        set_selection(
+            hwnd,
+            CharRange {
+                cp_min: start,
+                cp_max: end,
+            },
+        );
+        let mut format = char_format();
+        format.dw_mask = CFM_STRIKEOUT | 0x4000_0000;
+        format.dw_effects = if struck { CFM_STRIKEOUT } else { 0 };
+        format.cr_text_color = if matches!(inner.palette.get(), Some(0x454545 | 0x6f7078)) {
+            0x00f6f5f5
+        } else {
+            0x003d3432
+        };
+        SendMessageW(
+            hwnd,
+            EM_SETCHARFORMAT,
+            SCF_SELECTION,
+            (&format as *const CharFormat2W) as LPARAM,
+        );
+    }
+    set_selection(hwnd, previous);
+    inner.suppress_change.set(suppress);
+}
+
+unsafe fn style_completed_tasks(
+    hwnd: HWND,
+    document: &NativeDocument,
+    projection: &crate::native_projection::Projection,
+) {
+    let pointer = EDITORS.with(|editors| editors.borrow().get(&(hwnd as isize)).copied());
+    let Some(pointer) = pointer else { return };
+    let inner = &*pointer;
+    let Some(tom) = inner.text_document.as_ref() else {
+        return;
+    };
+    let bodies = crate::checklist_presentation::completed_bodies(&document.text);
+    if bodies.is_empty() {
+        return;
+    }
+    // Existing overlays must be removed by the caller before capturing styles.
+    if !inner.task_styles.borrow().is_empty() {
+        return;
+    }
+    let previous = selection(hwnd);
+    let suppress = inner.suppress_change.replace(true);
+    let _redraw = RedrawBatch::new(hwnd);
+    for (start, end) in bodies {
+        let mut boundaries = vec![start, end];
+        for &(a, b) in &document.strike {
+            boundaries.extend([a, b].into_iter().filter(|p| *p > start && *p < end));
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        for bounds in boundaries.windows(2) {
+            let a = projection.to_control(bounds[0]) as i32;
+            let b = projection.to_control(bounds[1]) as i32;
+            let Ok(range) = tom.Range(a, b) else { continue };
+            let struck = document
+                .strike
+                .iter()
+                .any(|&(s, e)| s <= bounds[0] && e >= bounds[1]);
+            inner.task_styles.borrow_mut().push((range, struck));
+            set_selection(
+                hwnd,
+                CharRange {
+                    cp_min: a,
+                    cp_max: b,
+                },
+            );
+            let mut format = char_format();
+            format.dw_mask = CFM_STRIKEOUT | 0x4000_0000;
+            format.dw_effects = CFM_STRIKEOUT;
+            format.cr_text_color = if matches!(inner.palette.get(), Some(0x454545 | 0x6f7078)) {
+                0x00b8b8b8
+            } else {
+                0x00808080
+            };
+            SendMessageW(
+                hwnd,
+                EM_SETCHARFORMAT,
+                SCF_SELECTION,
+                (&format as *const CharFormat2W) as LPARAM,
+            );
+        }
+    }
+    // Date labels retain their own foreground/background within a task.
+    style_chips(hwnd, projection);
+    set_selection(hwnd, previous);
+    inner.suppress_change.set(suppress);
 }
 
 unsafe fn style_chips(hwnd: HWND, projection: &crate::native_projection::Projection) {
@@ -1243,10 +1414,10 @@ unsafe fn style_chips(hwnd: HWND, projection: &crate::native_projection::Project
             },
         );
         let mut label = char_format();
-        label.dw_mask = 0x4000_0000 | 0x0400_0000 | CFM_BOLD | 0x100;
-        label.dw_effects = CFM_BOLD;
-        label.cr_text_color = 0x006f4b2b;
-        label.cr_back_color = 0x00ffe8dc;
+        label.dw_mask = 0x4000_0000 | 0x0400_0000 | CFM_BOLD | CFM_UNDERLINE | 0x100;
+        label.dw_effects = CFM_UNDERLINE;
+        label.cr_text_color = 0x00303132;
+        label.cr_back_color = 0x00a8e3f1;
         SendMessageW(
             hwnd,
             EM_SETCHARFORMAT,
@@ -1843,6 +2014,92 @@ mod tests {
     }
 
     #[test]
+    fn inline_checkboxes_preserve_source_and_date_identity_after_replacement() {
+        let _guard = native_test_guard();
+        let parent = TestParent::new();
+        let source = "[ ] café 😀 [[date:2026-10-03]]\n[x] Done";
+        let id = uuid::Uuid::new_v4().to_string();
+        let editor = NativeRichEditor::attach_to_parent(
+            parent.0,
+            1.0,
+            NativeDocument {
+                text: source.into(),
+                chip_ids: vec![id.clone()],
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(editor.document().text, source);
+        assert_eq!(editor.document().chip_ids, vec![id.clone()]);
+        let checked = source.replacen("[ ]", "[x]", 1);
+        editor.set_document(&NativeDocument {
+            text: checked.clone(),
+            chip_ids: vec![id.clone()],
+            ..Default::default()
+        });
+        assert_eq!(editor.document().text, checked);
+        assert_eq!(editor.document().chip_ids, vec![id.clone()]);
+        editor.history_action(false);
+        assert_eq!(editor.document().text, source);
+        assert_eq!(editor.document().chip_ids, vec![id]);
+    }
+
+    #[test]
+    fn completed_task_presentation_never_changes_saved_user_styles() {
+        let _guard = native_test_guard();
+        let parent = TestParent::new();
+        let source = "[x] café 😀 task\nOrdinary text";
+        let task = source.find("task").unwrap();
+        let expected = NativeDocument {
+            text: source.into(),
+            bold: vec![(4, 9)],
+            strike: vec![(task, task + 4)],
+            ..Default::default()
+        };
+        let editor =
+            NativeRichEditor::attach_to_parent(parent.0, 1.0, expected.clone(), |_| {}).unwrap();
+        for _ in 0..3 {
+            let snapshot = editor.document();
+            assert_eq!(snapshot.text, expected.text);
+            assert_eq!(snapshot.bold, expected.bold);
+            assert_eq!(snapshot.strike, expected.strike);
+        }
+        unsafe {
+            super::set_selection(
+                editor.inner.hwnd,
+                super::CharRange {
+                    cp_min: 4,
+                    cp_max: 5,
+                },
+            );
+            let mut format = super::char_format();
+            SendMessageW(
+                editor.inner.hwnd,
+                super::EM_GETCHARFORMAT,
+                super::SCF_SELECTION,
+                (&mut format as *mut super::CharFormat2W) as super::LPARAM,
+            );
+            assert_ne!(format.dw_effects & super::CFM_STRIKEOUT, 0);
+            assert_eq!(format.cr_text_color, 0x00808080);
+        }
+        let mut unchecked = expected.clone();
+        unchecked.text = source.replacen("[x]", "[ ]", 1);
+        editor.set_document(&unchecked);
+        assert_eq!(editor.document().strike, expected.strike);
+        editor.history_action(false);
+        assert_eq!(editor.document().text, expected.text);
+        assert_eq!(editor.document().strike, expected.strike);
+        editor.restore_selection(source, source.len(), source.len());
+        unsafe {
+            SendMessageW(editor.inner.hwnd, super::WM_CHAR, '!' as usize, 0);
+        }
+        let edited = editor.document();
+        assert_eq!(edited.text, format!("{source}!"));
+        assert_eq!(edited.strike, expected.strike);
+    }
+
+    #[test]
     fn native_palette_and_font_survive_replacement_and_undo() {
         let _guard = native_test_guard();
         let parent = TestParent::new();
@@ -1884,11 +2141,11 @@ mod tests {
                     super::SCF_SELECTION,
                     (&mut font as *mut super::CharFormat2W) as super::LPARAM,
                 );
-                assert_eq!(font.y_height, 220);
+                assert_eq!(font.y_height, 210);
                 assert_eq!(font.cr_text_color, 0x00f6f5f5);
                 let previous =
-                    SendMessageW(editor.inner.hwnd, super::EM_SETBKGNDCOLOR, 0, 0x0078706f);
-                assert_eq!(previous, 0x0078706f);
+                    SendMessageW(editor.inner.hwnd, super::EM_SETBKGNDCOLOR, 0, 0x00454545);
+                assert_eq!(previous, 0x00454545);
             }
         }
     }

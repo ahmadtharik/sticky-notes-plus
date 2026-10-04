@@ -11,13 +11,13 @@ use windows_sys::Win32::{
     },
 };
 
-struct Stats {
-    cpu_seconds: f64,
-    working_set_mib: f64,
-    private_commit_mib: f64,
+pub(crate) struct Stats {
+    pub(crate) cpu_seconds: f64,
+    pub(crate) working_set_mib: f64,
+    pub(crate) private_commit_mib: f64,
 }
 
-fn stats() -> std::io::Result<Stats> {
+pub(crate) fn stats() -> std::io::Result<Stats> {
     let mut created = FILETIME::default();
     let mut exited = FILETIME::default();
     let mut kernel = FILETIME::default();
@@ -330,6 +330,7 @@ pub fn preview() -> Result<(), Box<dyn std::error::Error>> {
             entries.retain(|entry| entry.window.window().is_visible());
             let guard = db.lock().unwrap();
             for entry in entries.iter_mut() {
+                window_chrome::update_hover(&entry.window);
                 if let Some(native) = &entry.native_editor {
                     let [width, height] = native.client_size();
                     entry.window.set_native_client_width(width);
