@@ -369,12 +369,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 4 || !matches!(args[2].as_str(), "1" | "20") {
         return Err(
-            "Usage: --editor-probe, --editor-soak or --attachment-probe <1|20> <new-report.json>"
+            "Usage: --editor-probe, --editor-soak, --attachment-probe or --attachment-soak <1|20> <new-report.json>"
                 .into(),
         );
     }
-    let soak = args[1] == "--editor-soak";
-    let with_images = args[1] == "--attachment-probe";
+    let soak = matches!(args[1].as_str(), "--editor-soak" | "--attachment-soak");
+    let with_images = matches!(args[1].as_str(), "--attachment-probe" | "--attachment-soak");
     let phases = if soak { SOAK_PHASES } else { PHASES };
     let count: usize = args[2].parse()?;
     // Refuse to overwrite an existing report. The production database is never
@@ -438,6 +438,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     {
         return Err("Probe could not create all native editors; no valid measurement".into());
     }
+    let source = windows.borrow()[0].window.get_editor_text().to_string();
     let expected_chip_ids = crate::native_projection::content_ids(
         &notes::get(&db.lock().unwrap().conn, "probe-0")?
             .unwrap()
@@ -516,8 +517,11 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             if index == 2 {
                 if with_images && *injected.borrow() % 10 == 0 {
-                    // Exercise the actual preview callback once a second.
-                    for entry in editors.iter() { entry.window.invoke_browse_image(1); }
+                    // Exercise inline image layout once per second; there is
+                    // no separate decoded attachment preview in native mode.
+                    for entry in editors.iter() {
+                        if let Some(native) = &entry.native_editor { native.set_layout_bounds([entry.window.get_editor_left(), entry.window.get_editor_top(), (entry.window.get_editor_width() - 30.0).max(180.0), entry.window.get_editor_height()]); }
+                    }
                 }
                 editors[0]
                     .native_editor
@@ -547,6 +551,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             for item in images {
                 crate::db::attachments::thumbnail(&disk.conn, &item.id)?;
+                let note = notes::get(&disk.conn, &entry.id)?.unwrap();
+                if !crate::inline_images::content_ids(&note.content).contains(&item.id) {
+                    return Err("Inline image placement was lost".into());
+                }
             }
         }
     }
@@ -587,7 +595,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         "chip_identity_verified": true, "extended_workload": soak,
         "attachments_per_note": if with_images { 3 } else { 0 },
         "image_dimensions": if with_images { "1600x1200 PNG" } else { "none" },
-        "preview_workload": if with_images { "one 320x240 maximum preview per note; browse every note once/second during typing" } else { "none" },
+        "preview_workload": if with_images { "three native inline thumbnails per note; resize inline layout once/second during typing" } else { "none" },
         "attachment_persistence_verified": with_images,
         "limitations": "No tray/hotkey timers; overlapping notes; synthetic input is not IME/visual acceptance; bounded run is not a long-duration leak test",
         "persisted_input_verified": true, "phases": &*results.borrow(),

@@ -129,6 +129,7 @@ component SelectionEditor inherits Rectangle {
 // colored rectangle preserves the familiar sticky-note palette while the
 // FocusScope supplies Space/Enter activation for keyboard users.
 component NoteAction inherits Rectangle {
+    in property <bool> action-enabled: true;
     in property <string> text;
     in property <string> label: text;
     in property <color> foreground: #353535;
@@ -144,17 +145,17 @@ component NoteAction inherits Rectangle {
     background: hit.has-hover || keyboard.has-focus ? #00000012 : transparent;
     accessible-role: button;
     accessible-label: label;
-    accessible-action-default => { root.clicked(); }
+    accessible-action-default => { if (root.action-enabled) { root.clicked(); } }
     forward-focus: keyboard;
     keyboard := FocusScope {
         width: parent.width;
         height: parent.height;
         key-pressed(event) => {
-            if (event.text == Key.Return || event.text == Key.Space) { root.clicked(); return accept; }
+            if (root.action-enabled && (event.text == Key.Return || event.text == Key.Space)) { root.clicked(); return accept; }
             reject
         }
     }
-    hit := TouchArea { width: parent.width; height: parent.height; clicked => { root.clicked(); } }
+    hit := TouchArea { enabled: root.action-enabled; width: parent.width; height: parent.height; clicked => { root.clicked(); } }
     Text {
         visible: !root.has-icon || root.menu-row;
         x: root.menu-row ? (root.has-icon ? 48px : 16px) : 0px;
@@ -515,6 +516,7 @@ export component NoteWindow inherits Window {
     in-out property <string> attachment-caption;
     in-out property <int> attachment-index: 0;
     in-out property <int> attachment-count: 0;
+    in-out property <bool> inline-image-mode: false;
     in-out property <bool> attachment-remove-pending: false;
     callback add-image();
     callback browse-image(int);
@@ -620,10 +622,10 @@ export component NoteWindow inherits Window {
                 // Retain its snapshot as context while canvas overlays are open.
                 visible: !root.native-editor-active || root.date-panel-open || root.overflow-open;
                 native-mode: root.native-editor-active && !root.date-panel-open && !root.overflow-open;
-                read-only: root.native-editor-active;
+                read-only: root.native-editor-active || root.inline-image-mode;
                 width: parent.width;
                 height: parent.height;
-                text: root.native-editor-active ? root.date-preview-text : root.editor-text;
+                text: root.native-editor-active || root.inline-image-mode ? root.date-preview-text : root.editor-text;
                 text-color: root.note-foreground;
                 placeholder-text: "Write a note…\nUse [ ] for checklist items.";
                 edited => { root.editor-text = self.text; root.editor-text-edited(self.text); }
@@ -646,7 +648,7 @@ export component NoteWindow inherits Window {
         }
         // Conditional creation removes this preview's layout constraints too;
         // merely hiding it still reserves its height in the vertical layout.
-        if !root.native-editor-active && checklist-items.length > 0 && root.content-height >= 330px: Rectangle {
+        if !root.native-editor-active && !root.inline-image-mode && checklist-items.length > 0 && root.content-height >= 330px: Rectangle {
             background: root.note-color-value == "#6F7078" ? #00000025 : #ffffff75;
             border-width: 1px;
             border-color: #00000018;
@@ -665,7 +667,7 @@ export component NoteWindow inherits Window {
                 }
             }
         }
-        if root.attachment-count > 0: Rectangle {
+        if root.attachment-count > 0 && !root.native-editor-active: Rectangle {
             height: min(110px, max(36px, root.content-height / 4));
             background: #ffffff55;
             border-radius: 6px;
@@ -680,7 +682,7 @@ export component NoteWindow inherits Window {
                         spacing: 2px;
                         Button { visible: !root.attachment-remove-pending; text: "‹"; min-width: 0px; preferred-width: 24px; enabled: root.attachment-count > 1; clicked => { root.browse-image(-1); } }
                         Button { visible: !root.attachment-remove-pending; text: "›"; min-width: 0px; preferred-width: 24px; enabled: root.attachment-count > 1; clicked => { root.browse-image(1); } }
-                        Button { text: root.attachment-remove-pending ? "Delete" : "Remove"; min-width: 0px; clicked => { if (root.attachment-remove-pending) { root.remove-image(); } else { root.attachment-remove-pending = true; } } }
+                        Button { visible: !root.inline-image-mode; text: root.attachment-remove-pending ? "Delete" : "Remove"; min-width: 0px; clicked => { if (root.attachment-remove-pending) { root.remove-image(); } else { root.attachment-remove-pending = true; } } }
                         Button { visible: root.attachment-remove-pending; text: "×"; min-width: 0px; preferred-width: 24px; clicked => { root.attachment-remove-pending = false; } }
                     }
                     Rectangle { vertical-stretch: 1; }
@@ -703,14 +705,14 @@ export component NoteWindow inherits Window {
             HorizontalLayout {
                 height: 40px;
                 spacing: 0px;
-                NoteAction { foreground: root.note-foreground; text: "B"; label: "Bold"; emphasis: true; width: 32px; clicked => { root.toggle-selection-style("bold", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
-                NoteAction { foreground: root.note-foreground; text: "I"; italic: true; label: "Italic"; width: 32px; clicked => { root.toggle-selection-style("italic", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
-                NoteAction { foreground: root.note-foreground; text: "U̲"; label: "Underline"; width: 32px; clicked => { root.toggle-selection-style("underline", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
-                NoteAction { foreground: root.note-foreground; text: "a̶b̶"; label: "Strikethrough"; width: 32px; clicked => { root.toggle-selection-style("strike", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
-                NoteAction { foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/list.svg"); label: "Bullet list"; width: 32px; clicked => { editor-input.apply-list("bullet"); } }
-                NoteAction { foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/image.svg"); label: "Add image"; width: 32px; clicked => { root.add-image(); } }
-                NoteAction { foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/checklist.svg"); label: "Checklist"; width: 32px; clicked => { editor-input.apply-list("checklist"); } }
-                NoteAction { foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/calendar.svg"); label: "Date picker"; width: 32px; clicked => { root.toggle-date-panel(); } }
+                NoteAction { action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "B"; label: "Bold"; emphasis: true; width: 32px; clicked => { root.toggle-selection-style("bold", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                NoteAction { action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "I"; italic: true; label: "Italic"; width: 32px; clicked => { root.toggle-selection-style("italic", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                NoteAction { action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "U̲"; label: "Underline"; width: 32px; clicked => { root.toggle-selection-style("underline", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                NoteAction { action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "a̶b̶"; label: "Strikethrough"; width: 32px; clicked => { root.toggle-selection-style("strike", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                NoteAction { action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/list.svg"); label: "Bullet list"; width: 32px; clicked => { editor-input.apply-list("bullet"); } }
+                NoteAction { action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/image.svg"); label: "Add image"; width: 32px; clicked => { root.add-image(); } }
+                NoteAction { action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/checklist.svg"); label: "Checklist"; width: 32px; clicked => { editor-input.apply-list("checklist"); } }
+                NoteAction { action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/calendar.svg"); label: "Date picker"; width: 32px; clicked => { root.toggle-date-panel(); } }
                 Rectangle { horizontal-stretch: 1; }
             }
             if root.save-error: HorizontalLayout {

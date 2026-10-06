@@ -9,8 +9,11 @@ mod editor_history;
 mod editor_probe;
 mod hotkey;
 mod image_picker;
+mod inline_images;
 #[cfg(windows)]
 mod instance;
+#[cfg(windows)]
+mod native_image;
 mod native_projection;
 #[cfg(windows)]
 mod native_rich_editor;
@@ -565,6 +568,35 @@ fn push_text_run_with_ranges(
     base_offset: usize,
     ranges: &[(usize, usize)],
 ) {
+    let images = inline_images::occurrences(text);
+    if !images.is_empty() {
+        let mut cursor = 0;
+        for image in images {
+            push_text_run_with_ranges(
+                runs,
+                &text[cursor..image.start],
+                default_bold,
+                base_offset + cursor,
+                ranges,
+            );
+            runs.push(EditorRun {
+                kind: "image",
+                text: String::new(),
+                chip_label: String::new(),
+                date: Some(image.id),
+                bold: false,
+            });
+            cursor = image.end;
+        }
+        push_text_run_with_ranges(
+            runs,
+            &text[cursor..],
+            default_bold,
+            base_offset + cursor,
+            ranges,
+        );
+        return;
+    }
     if text.is_empty() {
         return;
     }
@@ -1004,6 +1036,15 @@ fn source_from_runs(runs: &[serde_json::Value]) -> (String, bool) {
                 .get("b")
                 .and_then(|value| value.as_bool())
                 .unwrap_or(false);
+        } else if run.get("type").and_then(|value| value.as_str()) == Some("image") {
+            if let Some(id) = run
+                .pointer("/attrs/attachmentId")
+                .and_then(|id| id.as_str())
+            {
+                if uuid::Uuid::parse_str(id).is_ok() {
+                    source.push_str(&inline_images::marker(id));
+                }
+            }
         } else if run.get("type").and_then(|value| value.as_str()) == Some("dateChip") {
             let attrs = run.get("attrs").unwrap_or(run);
             if let Some(date) = attrs
@@ -1108,6 +1149,8 @@ fn runs_to_json_with_prefix(runs: &[EditorRun], prefix: &str) -> (Vec<serde_json
             let (value, recurrence) = value.split_once('@').unwrap_or((value, "none"));
             let (day, time) = value.split_once('T').map_or((value, None), |(day, time)| (day, Some(time)));
             serde_json::json!({"type": "dateChip", "attrs": {"chipId": format!("slint-date-{}-{}", prefix, index), "date": day, "time": time, "recurrence": recurrence, "label": run.chip_label}})
+        } else if run.kind == "image" {
+            serde_json::json!({"type": "image", "attrs": {"attachmentId": run.date}})
         } else {
             plain.push_str(&run.text);
             serde_json::json!({"t": run.text, "b": run.bold})
@@ -1226,10 +1269,7 @@ fn checklist_preview_items(source: &str) -> Vec<ChecklistState> {
 
 fn apply_editor_state(editor: &NoteWindow, source: &str, bold: bool, bold_ranges: &str) {
     editor.set_editor_text(source.into());
-    let mut preview = source.to_owned();
-    for chip in date_chip_occurrences(source).iter().rev() {
-        preview.replace_range(chip.start..chip.end, &chip.label);
-    }
+    let preview = native_projection::Projection::from_source_visible(source, &[]).control;
     editor.set_date_preview_text(preview.into());
     editor.set_editor_bold(bold);
     let mut formats = parse_format_ranges(bold_ranges);
@@ -1322,6 +1362,16 @@ fn initialize_date_picker(editor: &NoteWindow, value: &str) {
 }
 
 fn sync_editor_presentation(editor: &NoteWindow, note: &notes::NoteRow) {
+    editor.set_inline_image_mode(
+        serde_json::from_str::<serde_json::Value>(&note.content)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/editor/inlineImages")
+                    .and_then(|v| v.as_bool())
+            })
+            .unwrap_or(false),
+    );
     editor.set_note_title(
         note.title
             .clone()
@@ -1351,12 +1401,20 @@ fn editor_snapshot(editor: &NoteWindow) -> EditorSnapshot {
     let text = editor.get_editor_text().to_string();
     let bold = editor.get_editor_bold();
     let formats = parse_format_ranges(&editor.get_editor_bold_ranges());
+    let content = native_projection::with_ids(
+        &content_for_editor_with_checklists_and_formats(&text, bold, &formats),
+        &serde_json::from_str::<Vec<String>>(&editor.get_editor_chip_identities())
+            .unwrap_or_default(),
+    );
+    let content = if editor.get_inline_image_mode() {
+        let mut value: serde_json::Value = serde_json::from_str(&content).unwrap();
+        value["editor"]["inlineImages"] = true.into();
+        value.to_string()
+    } else {
+        content
+    };
     EditorSnapshot {
-        content: native_projection::with_ids(
-            &content_for_editor_with_checklists_and_formats(&text, bold, &formats),
-            &serde_json::from_str::<Vec<String>>(&editor.get_editor_chip_identities())
-                .unwrap_or_default(),
-        ),
+        content,
         color: editor.get_note_color_value().to_string(),
     }
 }
@@ -1809,7 +1867,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     if matches!(
         std::env::args().nth(1).as_deref(),
-        Some("--editor-probe" | "--editor-soak" | "--attachment-probe")
+        Some("--editor-probe" | "--editor-soak" | "--attachment-probe" | "--attachment-soak")
     ) {
         return editor_probe::run();
     }
@@ -2044,8 +2102,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut windows = windows.borrow_mut();
             // Release hidden note hosts outside their close callbacks. Native
             // child procedures must not be destroyed while dispatching an event.
-            windows.retain(|entry| entry.window.window().is_visible());
-            let guard = db.lock().unwrap();
+            let retired: Vec<_> = windows
+                .iter()
+                .filter(|entry| {
+                    !entry.window.window().is_visible() && !entry.save_state.borrow().dirty
+                })
+                .map(|entry| entry.id.clone())
+                .collect();
+            windows.retain(|entry| {
+                entry.window.window().is_visible() || entry.save_state.borrow().dirty
+            });
+            for id in retired {
+                let _ = attachments::retire_unplaced(&db.lock().unwrap().conn, &id);
+            }
             for entry in windows.iter_mut() {
                 #[cfg(windows)]
                 window_chrome::update_hover(&entry.window);
@@ -2062,6 +2131,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let geometry = WindowGeometry::from_window(&entry.window.window());
                 if geometry != entry.last_geometry {
+                    let guard = db.lock().unwrap();
                     let _ = notes::save_window_geom(
                         &guard.conn,
                         &entry.id,
@@ -2486,6 +2556,9 @@ fn sync_attachments(editor: &NoteWindow, conn: &rusqlite::Connection, id: &str, 
             editor.set_attachment_caption(
                 format!("{} / {} · {}", index + 1, items.len(), item.name).into(),
             );
+            if editor.get_native_editor_active() {
+                return;
+            }
             match attachments::thumbnail(conn, &item.id) {
                 Ok(image) => editor.set_attachment_preview(image),
                 Err(error) => {
@@ -2495,6 +2568,49 @@ fn sync_attachments(editor: &NoteWindow, conn: &rusqlite::Connection, id: &str, 
         }
         Err(error) => editor.set_format_status(format!("Couldn't load images: {error}").into()),
     }
+}
+
+#[cfg(windows)]
+fn insert_native_image(
+    window: &NoteWindow,
+    native: &NativeRichEditor,
+    db: &Arc<Mutex<Db>>,
+    id: &str,
+    prepared: attachments::PreparedImage,
+) -> Result<(), String> {
+    let image_id = prepared.item.id.clone();
+    let candidate = native.document_with_image(&image_id);
+    let formats = FormatRanges {
+        bold: candidate.bold.clone(),
+        italic: candidate.italic.clone(),
+        underline: candidate.underline.clone(),
+        strike: candidate.strike.clone(),
+    };
+    let content = native_projection::with_ids(
+        &content_for_editor_with_checklists_and_formats(&candidate.text, false, &formats),
+        &candidate.chip_ids,
+    );
+    let mut content: serde_json::Value = serde_json::from_str(&content).unwrap();
+    content["editor"]["inlineImages"] = true.into();
+    attachments::commit_prepared(
+        &db.lock().unwrap().conn,
+        id,
+        prepared,
+        Some(&content.to_string()),
+    )
+    .map_err(|error| error.to_string())?;
+    window.set_inline_image_mode(true);
+    native.commit_image_document(&candidate, &image_id);
+    if !native.image_errors().is_empty() {
+        window.set_format_status(
+            format!(
+                "Image saved; preview unavailable: {}",
+                native.image_errors().join("; ")
+            )
+            .into(),
+        );
+    }
+    Ok(())
 }
 
 fn open_editor(
@@ -2618,6 +2734,8 @@ fn open_editor(
         let id = id.to_owned();
         let state = save_state.clone();
         let board = weak_board.clone();
+        #[cfg(windows)]
+        let native_for_image = native_editor_slot.clone();
         editor.on_add_image(move || {
             let Some(window) = weak.upgrade() else {
                 return;
@@ -2628,6 +2746,14 @@ fn open_editor(
             }
             let result = image_picker::select(&window.window()).and_then(|path| {
                 if let Some(path) = path {
+                    #[cfg(windows)]
+                    if let Some(native) = native_for_image.borrow().as_ref() {
+                        let prepared = attachments::prepare_file(&path)?;
+                        insert_native_image(&window, native, &db, &id, prepared)
+                            .map_err(anyhow::Error::msg)?;
+                        flush_editor(&db, &id, &window, &state, &board);
+                        return Ok(());
+                    }
                     let guard = db.lock().unwrap();
                     attachments::import_image(&guard.conn, &id, &path)?;
                     let count = attachments::list(&guard.conn, &id)?.len() as i32;
@@ -3290,6 +3416,75 @@ fn open_editor(
             ) {
                 Ok(native) => {
                     let native = Rc::new(native);
+                    let paste_native = Rc::downgrade(&native);
+                    let paste_window = editor.as_weak();
+                    let paste_db = db.clone();
+                    let paste_id = id.to_owned();
+                    let paste_state = save_state.clone();
+                    let paste_board = weak_board.clone();
+                    native.on_image_paste(move |result| {
+                        let (Some(window), Some(native)) =
+                            (paste_window.upgrade(), paste_native.upgrade())
+                        else {
+                            return;
+                        };
+                        let result = result.and_then(|bytes| {
+                            if !flush_editor(
+                                &paste_db,
+                                &paste_id,
+                                &window,
+                                &paste_state,
+                                &paste_board,
+                            ) {
+                                return Err("Save pending edits before pasting an image".into());
+                            }
+                            let prepared = attachments::prepare_bytes(bytes, "Pasted image.png")
+                                .map_err(|error| error.to_string())?;
+                            insert_native_image(&window, &native, &paste_db, &paste_id, prepared)?;
+                            flush_editor(&paste_db, &paste_id, &window, &paste_state, &paste_board);
+                            Ok(())
+                        });
+                        if let Err(error) = result {
+                            window
+                                .set_format_status(format!("Couldn't paste image: {error}").into());
+                        }
+                    });
+                    let image_db = db.clone();
+                    let image_note = id.to_owned();
+                    native.set_image_loader(move |image_id| {
+                        let guard = image_db
+                            .lock()
+                            .map_err(|_| "Database unavailable".to_owned())?;
+                        let owned = attachments::list(&guard.conn, &image_note)
+                            .map_err(|error| error.to_string())?
+                            .iter()
+                            .any(|image| image.id == image_id);
+                        if !owned {
+                            return Err("Image is not owned by this note".into());
+                        }
+                        attachments::thumbnail_bytes(&guard.conn, image_id)
+                            .map_err(|error| error.to_string())
+                    });
+                    if !editor.get_inline_image_mode() {
+                        let items =
+                            attachments::list(&db.lock().unwrap().conn, id).unwrap_or_default();
+                        let mut document = native_document_from_editor(&editor);
+                        let existing = inline_images::occurrences(&document.text);
+                        for image in items {
+                            if !existing.iter().any(|item| item.id == image.id) {
+                                if !document.text.is_empty() {
+                                    document.text.push('\n');
+                                }
+                                document.text.push_str(&inline_images::marker(&image.id));
+                            }
+                        }
+                        editor.set_inline_image_mode(true);
+                        apply_native_document_to_editor(&editor, &document);
+                        native.set_document(&document);
+                        remember_editor_text(&save_state, &document.text);
+                        mark_editor_dirty(&editor, &save_state);
+                        flush_editor(db, id, &editor, &save_state, &weak_board);
+                    }
                     let clicked_window = editor.as_weak();
                     let checkbox_window = editor.as_weak();
                     native.on_checklist_clicked(move |line, checked| {
@@ -3358,10 +3553,20 @@ fn open_editor(
                     *native_editor_slot.borrow_mut() = Some(native.clone());
                     save_state.borrow_mut().native_editor = Some(Rc::downgrade(&native));
                     editor.set_native_editor_active(true);
+                    editor.set_attachment_preview(slint::Image::default());
                     let [width, height] = native.client_size();
                     editor.set_native_client_width(width);
                     editor.set_native_client_height(height);
                     native.set_palette(&editor.get_note_color_value());
+                    if !native.image_errors().is_empty() {
+                        editor.set_format_status(
+                            format!(
+                                "Image preview unavailable (reference retained): {}",
+                                native.image_errors().join("; ")
+                            )
+                            .into(),
+                        );
+                    }
                     Some(native)
                 }
                 Err(error) => {
@@ -3372,6 +3577,9 @@ fn open_editor(
             }
         }
     };
+    if editor.get_inline_image_mode() && !editor.get_native_editor_active() {
+        editor.set_format_status("Inline-image note is read-only in the fallback editor. Enable the native editor to edit; originals are retained.".into());
+    }
     editor.window().request_redraw();
     let geometry = WindowGeometry::from_window(&editor.window());
     {

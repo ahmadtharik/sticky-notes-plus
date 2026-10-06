@@ -155,6 +155,29 @@ pub fn save_content_and_color(
     content: &str,
     color: Option<&str>,
 ) -> rusqlite::Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    save_content_in_transaction(&tx, id, content, color)?;
+    tx.commit()
+}
+
+pub fn save_content_in_transaction(
+    conn: &Connection,
+    id: &str,
+    content: &str,
+    color: Option<&str>,
+) -> rusqlite::Result<()> {
+    for image in crate::inline_images::content_ids(content) {
+        let owned: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attachments WHERE id=?1 AND note_id=?2)",
+            rusqlite::params![image, id],
+            |r| r.get(0),
+        )?;
+        if !owned {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "Image is not owned by this note".into(),
+            ));
+        }
+    }
     let previous = get(conn, id)?.ok_or(rusqlite::Error::QueryReturnedNoRows)?;
     // A hidden editor can outlive a board action. Never let an autosave for a
     // deleted note recreate its reminder projection (or otherwise resurrect
@@ -164,8 +187,7 @@ pub fn save_content_and_color(
     }
     let content = crate::content_identity::reconcile_identities(&previous.content, content)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    let tx = conn.unchecked_transaction()?;
-    let n = tx.execute(
+    let n = conn.execute(
         "UPDATE notes SET content=?2,title=?3,color=coalesce(?4,color),modified_at=?5 WHERE id=?1 AND deleted_at IS NULL",
         params![
             id,
@@ -178,9 +200,9 @@ pub fn save_content_and_color(
     if n == 0 {
         return Err(rusqlite::Error::QueryReturnedNoRows);
     }
-    sync_note_fts(&tx, id)?;
-    reminders::reconcile_note_in_transaction(&tx, id, &content)?;
-    tx.commit()
+    sync_note_fts(conn, id)?;
+    reminders::reconcile_note_in_transaction(conn, id, &content)?;
+    Ok(())
 }
 
 pub fn update_meta(

@@ -10,6 +10,7 @@ pub struct ChipSpan {
     pub hidden_end: usize,
     pub control_end: usize,
     pub id: String,
+    pub image: bool,
 }
 
 pub struct Projection {
@@ -93,24 +94,43 @@ impl Projection {
         let mut chips = Vec::new();
         let mut cursor = 0;
         let mut seen = std::collections::HashSet::new();
-        for (index, chip) in crate::date_chip_occurrences(source).iter().enumerate() {
-            control.push_str(&source[cursor..chip.start]);
-            let id = ids
-                .get(index)
-                .filter(|id| Uuid::parse_str(id).is_ok() && seen.insert((*id).clone()))
-                .cloned()
-                .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let mut atoms: Vec<_> = crate::date_chip_occurrences(source)
+            .into_iter()
+            .enumerate()
+            .map(|(index, chip)| (chip.start, chip.end, Some(index), chip.label, String::new()))
+            .collect();
+        atoms.extend(
+            crate::inline_images::occurrences(source)
+                .into_iter()
+                .map(|image| (image.start, image.end, None, "□".into(), image.id)),
+        );
+        atoms.sort_by_key(|atom| atom.0);
+        for (start, end, index, label, image_id) in atoms {
+            if start < cursor {
+                continue;
+            }
+            control.push_str(&source[cursor..start]);
+            let image = index.is_none();
+            let id = if let Some(index) = index {
+                ids.get(index)
+                    .filter(|id| Uuid::parse_str(id).is_ok() && seen.insert((*id).clone()))
+                    .cloned()
+                    .unwrap_or_else(|| Uuid::new_v4().to_string())
+            } else {
+                image_id
+            };
             let control_start = units(&control);
-            control.push_str(&format!(" {} ", chip.label));
+            control.push_str(&if image { label } else { format!(" {label} ") });
             chips.push(ChipSpan {
-                source_start: chip.start,
-                source_end: chip.end,
+                source_start: start,
+                source_end: end,
                 control_start,
                 hidden_end: control_start,
                 control_end: units(&control),
                 id,
+                image,
             });
-            cursor = chip.end;
+            cursor = end;
         }
         control.push_str(&source[cursor..]);
         Self {
@@ -146,7 +166,12 @@ impl Projection {
             if tracked.control_end <= tracked.control_start || tracked.control_end > control_units {
                 continue;
             }
-            let label = format!(" {} ", crate::date_label(&tracked.date));
+            let image = tracked.date.starts_with("image:");
+            let label = if image {
+                "\u{fffc}".into()
+            } else {
+                format!(" {} ", crate::date_label(&tracked.date))
+            };
             let label_units = units(&label);
             let exact = (tracked.control_end - tracked.control_start == label_units)
                 .then_some((tracked.control_start, tracked.control_end));
@@ -157,7 +182,8 @@ impl Projection {
             let matches_label = |bounds: (usize, usize)| {
                 let start = byte_at_unit(control, bounds.0)?;
                 let end = byte_at_unit(control, bounds.1)?;
-                (&control[start..end] == label).then_some((bounds.0, bounds.1, start, end))
+                (&control[start..end] == label || (image && &control[start..end] == "□"))
+                    .then_some((bounds.0, bounds.1, start, end))
             };
             let candidate = exact.and_then(matches_label).or_else(|| {
                 let prefix = prefix.and_then(matches_label);
@@ -182,15 +208,19 @@ impl Projection {
             };
             if start < cursor
                 || end <= start
-                || !crate::valid_date(&tracked.date)
+                || (!image && !crate::valid_date(&tracked.date))
                 || Uuid::parse_str(&tracked.id).is_err()
             {
                 continue;
             }
             source.push_str(&control[cursor..start]);
             let source_start = source.len();
-            source.push_str(&format!("[[date:{}]]", tracked.date));
-            let id = if seen.insert(tracked.id.clone()) {
+            source.push_str(&if image {
+                crate::inline_images::marker(&tracked.id)
+            } else {
+                format!("[[date:{}]]", tracked.date)
+            });
+            let id = if image || seen.insert(tracked.id.clone()) {
                 tracked.id
             } else {
                 repaired = true;
@@ -203,6 +233,7 @@ impl Projection {
                 hidden_end: control_start,
                 control_end,
                 id,
+                image,
             });
             cursor = end;
         }
@@ -231,6 +262,7 @@ impl Projection {
                     hidden_end: start,
                     control_end: end,
                     id: Uuid::new_v4().to_string(),
+                    image: false,
                 }
             })
             .collect();
@@ -266,6 +298,7 @@ impl Projection {
                 hidden_end,
                 control_end: units(&control),
                 id,
+                image: false,
             });
             cursor = chip.end;
         }
@@ -323,6 +356,7 @@ impl Projection {
                 hidden_end: units(&control[..hidden_end]),
                 control_end: units(&control[..end]),
                 id,
+                image: false,
             });
             cursor = end;
         }
@@ -353,6 +387,7 @@ impl Projection {
                     hidden_end: start,
                     control_end: end,
                     id: Uuid::new_v4().to_string(),
+                    image: false,
                 }
             })
             .collect();
@@ -365,7 +400,11 @@ impl Projection {
     }
 
     pub fn ids(&self) -> Vec<String> {
-        self.chips.iter().map(|chip| chip.id.clone()).collect()
+        self.chips
+            .iter()
+            .filter(|chip| !chip.image)
+            .map(|chip| chip.id.clone())
+            .collect()
     }
 
     /// Map plain glyphs once, rather than rescanning preceding chips and text

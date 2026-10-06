@@ -23,9 +23,8 @@ use windows_sys::Win32::{
         CallWindowProcW, CreateWindowExW, DestroyWindow, GetClientRect, GetWindowLongPtrW,
         MoveWindow, SendMessageW, SetWindowLongPtrW, ShowWindow, ES_AUTOVSCROLL, ES_MULTILINE,
         ES_NOHIDESEL, ES_WANTRETURN, GWLP_WNDPROC, GWL_STYLE, WM_CHAR, WM_CLEAR, WM_CUT,
-        WM_GETTEXT, WM_GETTEXTLENGTH, WM_IME_COMPOSITION, WM_KEYUP, WM_KILLFOCUS, WM_PASTE,
-        WM_SETTEXT, WM_UNDO, WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
-        WS_VSCROLL,
+        WM_GETTEXTLENGTH, WM_IME_COMPOSITION, WM_KEYUP, WM_KILLFOCUS, WM_PASTE, WM_SETTEXT,
+        WM_UNDO, WNDPROC, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE, WS_VSCROLL,
     },
 };
 
@@ -131,6 +130,10 @@ struct Inner {
     tracked_chips: RefCell<Vec<TrackedNativeChip>>,
     task_styles: RefCell<Vec<(ITextRange, bool)>>,
     last_edit_at: Cell<Option<usize>>,
+    image_loader: RefCell<Option<Box<dyn Fn(&str) -> Result<Vec<u8>, String>>>>,
+    images: RefCell<HashMap<String, Vec<u8>>>,
+    image_errors: RefCell<Vec<String>>,
+    image_paste: RefCell<Option<Box<dyn FnMut(Result<Vec<u8>, String>)>>>,
 }
 
 struct TrackedNativeChip {
@@ -193,9 +196,71 @@ pub struct NativeRichEditor {
     inner: Rc<Inner>,
     parent: HWND,
     added_parent_clip: bool,
+    _ole_session: Option<crate::native_image::OleSession>,
 }
 
 impl NativeRichEditor {
+    pub fn on_image_paste(&self, callback: impl FnMut(Result<Vec<u8>, String>) + 'static) {
+        *self.inner.image_paste.borrow_mut() = Some(Box::new(callback));
+    }
+    pub fn set_image_loader(&self, loader: impl Fn(&str) -> Result<Vec<u8>, String> + 'static) {
+        let document = unsafe { document_from_control(self.inner.hwnd) };
+        *self.inner.image_loader.borrow_mut() = Some(Box::new(loader));
+        self.inner.suppress_change.set(true);
+        unsafe { set_document(self.inner.hwnd, &document) };
+        self.inner.suppress_change.set(false);
+    }
+    pub fn image_errors(&self) -> Vec<String> {
+        self.inner.image_errors.borrow().clone()
+    }
+    pub fn document_with_image(&self, id: &str) -> NativeDocument {
+        self.flush_pending_change();
+        let mut document = unsafe { document_from_control(self.inner.hwnd) };
+        let projection = unsafe { control_projection(self.inner.hwnd) };
+        let range = unsafe { selection(self.inner.hwnd) };
+        let start = projection.to_source(range.cp_min.max(0) as usize);
+        let end = projection.to_source(range.cp_max.max(0) as usize);
+        let old = document.text.clone();
+        document
+            .text
+            .replace_range(start..end, &crate::inline_images::marker(id));
+        let mut formats = crate::FormatRanges {
+            bold: document.bold,
+            italic: document.italic,
+            underline: document.underline,
+            strike: document.strike,
+        };
+        crate::remap_formats_after_edit(&old, &document.text, &mut formats);
+        for ranges in [
+            &mut formats.bold,
+            &mut formats.italic,
+            &mut formats.underline,
+            &mut formats.strike,
+        ] {
+            crate::inline_images::exclude_from_styles(&document.text, ranges);
+        }
+        document.bold = formats.bold;
+        document.italic = formats.italic;
+        document.underline = formats.underline;
+        document.strike = formats.strike;
+        document.chip_ids = projection
+            .chips
+            .iter()
+            .filter(|chip| !chip.image && (chip.source_end <= start || chip.source_start >= end))
+            .map(|chip| chip.id.clone())
+            .collect();
+        document
+    }
+    pub fn commit_image_document(&self, document: &NativeDocument, id: &str) {
+        self.set_document(document);
+        if let Some(image) = crate::inline_images::occurrences(&document.text)
+            .into_iter()
+            .find(|image| image.id == id)
+        {
+            self.restore_selection(&document.text, image.end, image.end);
+        }
+        self.inner.emit_change();
+    }
     pub fn on_checklist_clicked(&self, callback: impl FnMut(i32, bool) + 'static) {
         *self.inner.checklist_clicked.borrow_mut() = Some(Box::new(callback));
     }
@@ -302,6 +367,10 @@ impl NativeRichEditor {
             palette: Cell::new(None),
             text_document: Some(text_document),
             tracked_chips: RefCell::new(Vec::new()),
+            image_loader: RefCell::new(None),
+            images: RefCell::new(HashMap::new()),
+            image_errors: RefCell::new(Vec::new()),
+            image_paste: RefCell::new(None),
             task_styles: RefCell::new(Vec::new()),
             last_edit_at: Cell::new(None),
         });
@@ -350,6 +419,7 @@ impl NativeRichEditor {
             inner,
             parent,
             added_parent_clip,
+            _ole_session: crate::native_image::OleSession::new().ok(),
         };
         editor.set_document(&document);
         editor.layout();
@@ -415,8 +485,18 @@ impl NativeRichEditor {
         let Ok(rgb) = u32::from_str_radix(value.trim_start_matches('#'), 16) else {
             return;
         };
-        self.inner.palette.set(Some(rgb));
-        unsafe { apply_palette(self.inner.hwnd, rgb) };
+        let changed = self.inner.palette.replace(Some(rgb)) != Some(rgb);
+        if changed && !self.inner.images.borrow().is_empty() {
+            self.flush_pending_change();
+            let document = unsafe { document_from_control(self.inner.hwnd) };
+            let selection = unsafe { selection(self.inner.hwnd) };
+            unsafe {
+                set_document(self.inner.hwnd, &document);
+                set_selection(self.inner.hwnd, selection);
+            }
+        } else {
+            unsafe { apply_palette(self.inner.hwnd, rgb) };
+        }
     }
 
     pub fn selection_byte_offsets(&self, source: &str) -> (i32, i32) {
@@ -550,8 +630,32 @@ impl NativeRichEditor {
         {
             return false;
         }
+        let width_changed = self
+            .inner
+            .layout_bounds
+            .get()
+            .map_or(true, |previous| previous[2] != bounds[2]);
+        let restore = if width_changed && !self.inner.images.borrow().is_empty() {
+            self.flush_pending_change();
+            Some(unsafe {
+                (
+                    document_from_control(self.inner.hwnd),
+                    selection(self.inner.hwnd),
+                )
+            })
+        } else {
+            None
+        };
         self.inner.layout_bounds.set(Some(bounds));
         self.layout();
+        if let Some((document, range)) = restore {
+            self.inner.suppress_change.set(true);
+            unsafe {
+                set_document(self.inner.hwnd, &document);
+                set_selection(self.inner.hwnd, range);
+            }
+            self.inner.suppress_change.set(false);
+        }
         true
     }
 
@@ -701,6 +805,32 @@ unsafe extern "system" fn rich_edit_proc(
         )));
     }
     let inner = &*pointer;
+    if message == WM_PASTE && inner.image_paste.borrow().is_some() && !inner.suppress_change.get() {
+        match crate::native_image::clipboard_content(hwnd) {
+            Ok(crate::native_image::ClipboardContent::Text(text)) => {
+                // Route plain text through the normal replacement path. Do not
+                // accept untracked OLE/RTF objects from another application.
+                return SendMessageW(hwnd, EM_REPLACESEL, 1, text.as_ptr() as LPARAM);
+            }
+            result => {
+                let result = result
+                    .map(|content| match content {
+                        crate::native_image::ClipboardContent::Image(bytes) => bytes,
+                        _ => unreachable!(),
+                    })
+                    .map_err(|error| error.to_string());
+                let weak = inner.weak_self.borrow().clone();
+                slint::Timer::single_shot(Duration::ZERO, move || {
+                    if let Some(inner) = weak.upgrade() {
+                        if let Some(callback) = inner.image_paste.borrow_mut().as_mut() {
+                            callback(result);
+                        }
+                    }
+                });
+                return 0;
+            }
+        }
+    }
     // Remove presentation-only effects before RichEdit changes text or starts
     // an IME composition, so insertion never inherits a completed-task strike.
     if !inner.suppress_change.get()
@@ -862,11 +992,9 @@ unsafe extern "system" fn rich_edit_proc(
             // Replacing selected chip text consumes that chip even if the
             // replacement happens to spell the same visible date label.
             inner.tracked_chips.borrow_mut().retain(|tracked| {
-                !projection.chips.iter().any(|chip| {
-                    chip.id == tracked.id
-                        && range.cp_min < chip.control_end as i32
-                        && range.cp_max > chip.control_start as i32
-                })
+                let start = tracked.range.GetStart().unwrap_or(-1);
+                let end = tracked.range.GetEnd().unwrap_or(-1);
+                !(range.cp_min < end && range.cp_max > start)
             });
         }
         let mut reset = char_format();
@@ -911,6 +1039,7 @@ unsafe extern "system" fn rich_edit_proc(
         if let Some((index, chip)) = projection
             .chips
             .iter()
+            .filter(|chip| !chip.image)
             .enumerate()
             .find(|(_, chip)| point >= chip.hidden_end && point < chip.control_end)
         {
@@ -1013,6 +1142,17 @@ unsafe fn set_selection(hwnd: HWND, range: CharRange) {
 }
 
 unsafe fn set_document(hwnd: HWND, document: &NativeDocument) {
+    struct ChangeGuard<'a>(&'a Cell<bool>, bool);
+    impl Drop for ChangeGuard<'_> {
+        fn drop(&mut self) {
+            self.0.set(self.1);
+        }
+    }
+    let pointer = EDITORS.with(|editors| editors.borrow().get(&(hwnd as isize)).copied());
+    let _changes = pointer.map(|pointer| {
+        let cell = &(*pointer).suppress_change;
+        ChangeGuard(cell, cell.replace(true))
+    });
     clear_task_styles(hwnd);
     let _redraw = RedrawBatch::new(hwnd);
     let projection = crate::native_projection::Projection::from_source_visible(
@@ -1024,6 +1164,69 @@ unsafe fn set_document(hwnd: HWND, document: &NativeDocument) {
     let mut wide: Vec<u16> = control_text.encode_utf16().collect();
     wide.push(0);
     SendMessageW(hwnd, WM_SETTEXT, 0, wide.as_ptr() as LPARAM);
+    EDITORS.with(|editors| {
+        let Some(pointer) = editors.borrow().get(&(hwnd as isize)).copied() else {
+            return;
+        };
+        let inner = &*pointer;
+        let mut retained = std::collections::HashSet::new();
+        for state in inner
+            .history
+            .borrow()
+            .retained()
+            .chain(std::iter::once(document))
+        {
+            retained.extend(
+                crate::inline_images::occurrences(&state.text)
+                    .into_iter()
+                    .map(|image| image.id),
+            );
+        }
+        inner
+            .images
+            .borrow_mut()
+            .retain(|id, _| retained.contains(id));
+        inner.image_errors.borrow_mut().clear();
+        for image in projection.chips.iter().filter(|chip| chip.image).rev() {
+            if !inner.images.borrow().contains_key(&image.id) {
+                if let Some(loader) = inner.image_loader.borrow().as_ref() {
+                    match loader(&image.id) {
+                        Ok(bytes) => {
+                            inner.images.borrow_mut().insert(image.id.clone(), bytes);
+                        }
+                        Err(error) => {
+                            inner.image_errors.borrow_mut().push(error);
+                        }
+                    }
+                }
+            }
+            if let Some(bytes) = inner.images.borrow().get(&image.id) {
+                set_selection(
+                    hwnd,
+                    CharRange {
+                        cp_min: image.control_start as i32,
+                        cp_max: image.control_end as i32,
+                    },
+                );
+                let empty: [u16; 1] = [0];
+                SendMessageW(hwnd, EM_REPLACESEL, 0, empty.as_ptr() as LPARAM);
+                let width = inner
+                    .layout_bounds
+                    .get()
+                    .map_or(320, |bounds| (bounds[2] - 12.0).max(1.0) as u32);
+                if let Err(error) = crate::native_image::insert_thumbnail_on_paper(
+                    hwnd,
+                    bytes,
+                    width,
+                    inner.palette.get().unwrap_or(0x00ff_ffff),
+                ) {
+                    inner.image_errors.borrow_mut().push(error.to_string());
+                    let placeholder: [u16; 2] = [0x25a1, 0];
+                    SendMessageW(hwnd, EM_REPLACESEL, 0, placeholder.as_ptr() as LPARAM);
+                }
+            }
+        }
+    });
     // WM_SETTEXT can inherit the previous insertion format. Replacements are
     // complete documents: clear owned effects before applying explicit ranges.
     set_selection(
@@ -1104,17 +1307,22 @@ unsafe fn track_chips(hwnd: HWND, projection: &crate::native_projection::Project
         let mut tracked = Vec::with_capacity(projection.chips.len());
         for chip in &projection.chips {
             let marker = &projection.source[chip.source_start..chip.source_end];
-            let Some(date) = marker
-                .strip_prefix("[[date:")
-                .and_then(|value| value.strip_suffix("]]"))
-            else {
+            let date = if chip.image {
+                Some(format!("image:{}", chip.id))
+            } else {
+                marker
+                    .strip_prefix("[[date:")
+                    .and_then(|value| value.strip_suffix("]]"))
+                    .map(str::to_owned)
+            };
+            let Some(date) = date else {
                 continue;
             };
             if let Ok(range) = tom.Range(chip.control_start as i32, chip.control_end as i32) {
                 tracked.push(TrackedNativeChip {
                     range,
                     id: chip.id.clone(),
-                    date: date.to_owned(),
+                    date,
                 });
             }
         }
@@ -1179,19 +1387,33 @@ unsafe fn apply_palette(hwnd: HWND, rgb: u32) {
 unsafe fn control_projection(hwnd: HWND) -> crate::native_projection::Projection {
     let length = SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0).max(0) as usize;
     let mut buffer = vec![0u16; length + 1];
+    use windows::Win32::UI::Controls::RichEdit::{EM_GETTEXTEX, GETTEXTEX, GT_RAWTEXT};
+    let request = GETTEXTEX {
+        cb: (buffer.len() * 2) as u32,
+        flags: GT_RAWTEXT,
+        codepage: 1200,
+        ..Default::default()
+    };
     SendMessageW(
         hwnd,
-        WM_GETTEXT,
-        buffer.len(),
+        EM_GETTEXTEX,
+        (&request as *const GETTEXTEX) as usize,
         buffer.as_mut_ptr() as LPARAM,
     );
     let end = buffer
         .iter()
         .position(|&unit| unit == 0)
         .unwrap_or(buffer.len());
-    let raw = crate::checklist_presentation::restore(
-        &String::from_utf16_lossy(&buffer[..end]).replace("\r\n", "\n"),
-    );
+    for position in crate::native_image::object_positions(hwnd) {
+        if position < end {
+            buffer[position] = 0xfffc;
+        }
+    }
+    // Raw-text mode preserves U+FFFC for objects, rather than substituting
+    // spaces, and excludes TOM's mandatory final paragraph.
+    let raw_text = String::from_utf16_lossy(&buffer[..end]);
+    let raw =
+        crate::checklist_presentation::restore(&raw_text.replace("\r\n", "\n").replace('\r', "\n"));
     let tracked = EDITORS.with(|editors| {
         let Some(pointer) = editors.borrow().get(&(hwnd as isize)).copied() else {
             return Vec::new();
@@ -1232,7 +1454,13 @@ unsafe fn control_projection(hwnd: HWND) -> crate::native_projection::Projection
         };
         let inner = &*pointer;
         inner.tracked_chips.borrow_mut().retain_mut(|chip| {
-            let Some(span) = projection.chips.iter().find(|span| span.id == chip.id) else {
+            let start = chip.range.GetStart().unwrap_or(-1).max(0) as usize;
+            let Some(span) = projection
+                .chips
+                .iter()
+                .filter(|span| span.id == chip.id)
+                .min_by_key(|span| span.control_start.abs_diff(start))
+            else {
                 return false;
             };
             if chip.range.GetStart().ok() == Some(span.control_start as i32)
@@ -1405,7 +1633,7 @@ unsafe fn style_completed_tasks(
 }
 
 unsafe fn style_chips(hwnd: HWND, projection: &crate::native_projection::Projection) {
-    for chip in &projection.chips {
+    for chip in projection.chips.iter().filter(|chip| !chip.image) {
         set_selection(
             hwnd,
             CharRange {
@@ -2097,6 +2325,309 @@ mod tests {
         let edited = editor.document();
         assert_eq!(edited.text, format!("{source}!"));
         assert_eq!(edited.strike, expected.strike);
+    }
+
+    #[test]
+    fn missing_inline_image_preserves_reference_and_remains_editable() {
+        let _guard = native_test_guard();
+        let parent = TestParent::new();
+        let source = format!(
+            "Before {} After",
+            crate::inline_images::marker(&uuid::Uuid::new_v4().to_string())
+        );
+        let editor = NativeRichEditor::attach_to_parent(
+            parent.0,
+            1.0,
+            NativeDocument {
+                text: source.clone(),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        editor.set_image_loader(|_| Err("Missing thumbnail".into()));
+        assert!(!editor.image_errors().is_empty());
+        assert_eq!(editor.document().text, source);
+        editor.restore_selection(&source, 0, 0);
+        unsafe {
+            SendMessageW(editor.inner.hwnd, super::WM_CHAR, 'X' as usize, 0);
+        }
+        assert_eq!(editor.document().text, format!("X{source}"));
+    }
+
+    #[test]
+    fn inline_images_keep_unicode_styles_date_ids_delete_undo_and_resize() {
+        let _guard = native_test_guard();
+        let parent = TestParent::new();
+        let image = uuid::Uuid::new_v4().to_string();
+        let source = format!(
+            "café 😀 [[date:2026-10-10]]\n{}\n[x] Done [[date:2026-10-11]]\n",
+            crate::inline_images::marker(&image)
+        );
+        let ids = vec![
+            uuid::Uuid::new_v4().to_string(),
+            uuid::Uuid::new_v4().to_string(),
+        ];
+        let expected = NativeDocument {
+            text: source.clone(),
+            bold: vec![(0, 5)],
+            chip_ids: ids.clone(),
+            ..Default::default()
+        };
+        let editor =
+            NativeRichEditor::attach_to_parent(parent.0, 1.0, expected.clone(), |_| {}).unwrap();
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(320, 240)
+            .write_to(&mut png, image::ImageOutputFormat::Png)
+            .unwrap();
+        let png = png.into_inner();
+        editor.set_image_loader(move |_| Ok(png.clone()));
+        assert!(
+            editor.image_errors().is_empty(),
+            "{:?}",
+            editor.image_errors()
+        );
+        for width in [300.0, 180.0, 400.0] {
+            editor.set_layout_bounds([0.0, 0.0, width, 400.0]);
+            let document = editor.document();
+            assert_eq!(document.text, source);
+            assert_eq!(document.chip_ids, ids);
+            assert_eq!(document.bold, expected.bold);
+            assert!(document.strike.is_empty());
+        }
+        let reference = crate::inline_images::occurrences(&source).remove(0);
+        editor.restore_selection(&source, reference.start, reference.end);
+        unsafe {
+            SendMessageW(editor.inner.hwnd, super::WM_CLEAR, 0, 0);
+        }
+        assert!(!editor.document().text.contains("[[image:"));
+        editor.history_action(false);
+        assert_eq!(editor.document().text, source);
+        assert_eq!(editor.document().chip_ids, ids);
+        editor.restore_selection(&source, 0, 0);
+        unsafe {
+            SendMessageW(editor.inner.hwnd, super::WM_CHAR, 'X' as usize, 0);
+        }
+        assert_eq!(editor.document().text, format!("X{source}"));
+        assert_eq!(editor.document().chip_ids, ids);
+    }
+
+    #[test]
+    fn caret_import_reopens_with_placement_and_unified_undo_redo() {
+        let _guard = native_test_guard();
+        let directory =
+            std::env::temp_dir().join(format!("sticky-native-image-{}", uuid::Uuid::new_v4()));
+        let db = crate::db::Db::open_in_dir(&directory).unwrap();
+        let source = "café 😀 then [[date:2026-10-10]]";
+        let id = uuid::Uuid::new_v4().to_string();
+        let initial = NativeDocument {
+            text: source.into(),
+            chip_ids: vec![id.clone()],
+            bold: vec![(0, 5)],
+            ..Default::default()
+        };
+        let initial_content = crate::native_projection::with_ids(
+            &crate::content_for_editor_with_checklists_and_formats(
+                source,
+                false,
+                &crate::FormatRanges {
+                    bold: initial.bold.clone(),
+                    ..Default::default()
+                },
+            ),
+            &initial.chip_ids,
+        );
+        crate::db::notes::create(&db.conn, "note", &initial_content, "#FFF9B1").unwrap();
+        let parent = TestParent::new();
+        let editor =
+            NativeRichEditor::attach_to_parent(parent.0, 1.0, initial.clone(), |_| {}).unwrap();
+        editor.restore_selection(source, 5, 5);
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(80, 60, image::Rgb([20, 80, 120]))
+            .write_to(&mut png, image::ImageOutputFormat::Png)
+            .unwrap();
+        let prepared =
+            crate::db::attachments::prepare_bytes(png.into_inner(), "Pasted image.png").unwrap();
+        let image_id = prepared.item.id.clone();
+        let candidate = editor.document_with_image(&image_id);
+        assert_eq!(
+            candidate.text,
+            format!(
+                "café{} 😀 then [[date:2026-10-10]]",
+                crate::inline_images::marker(&image_id)
+            )
+        );
+        assert_eq!(candidate.chip_ids, vec![id]);
+        let formats = crate::FormatRanges {
+            bold: candidate.bold.clone(),
+            italic: candidate.italic.clone(),
+            underline: candidate.underline.clone(),
+            strike: candidate.strike.clone(),
+        };
+        let content = crate::native_projection::with_ids(
+            &crate::content_for_editor_with_checklists_and_formats(
+                &candidate.text,
+                false,
+                &formats,
+            ),
+            &candidate.chip_ids,
+        );
+        let mut content: serde_json::Value = serde_json::from_str(&content).unwrap();
+        content["editor"]["inlineImages"] = true.into();
+        crate::db::attachments::commit_prepared(
+            &db.conn,
+            "note",
+            prepared,
+            Some(&content.to_string()),
+        )
+        .unwrap();
+        let thumbnail = crate::db::attachments::thumbnail_bytes(&db.conn, &image_id).unwrap();
+        editor.set_image_loader(move |_| Ok(thumbnail.clone()));
+        editor.commit_image_document(&candidate, &image_id);
+        assert_eq!(editor.document(), candidate);
+        editor.history_action(false);
+        assert_eq!(editor.document(), initial);
+        editor.history_action(true);
+        assert_eq!(editor.document(), candidate);
+        drop(editor);
+        drop(db);
+        let db = crate::db::Db::open_in_dir(&directory).unwrap();
+        let note = crate::db::notes::get(&db.conn, "note").unwrap().unwrap();
+        let (text, _, ranges) = crate::editor_state_from_content_with_checklists(&note.content);
+        let formats = crate::parse_format_ranges(&ranges);
+        let restored = NativeDocument {
+            text,
+            bold: formats.bold,
+            italic: formats.italic,
+            underline: formats.underline,
+            strike: formats.strike,
+            chip_ids: crate::native_projection::content_ids(&note.content),
+        };
+        let reopened = NativeRichEditor::attach_to_parent(parent.0, 1.0, restored, |_| {}).unwrap();
+        let thumbnail = crate::db::attachments::thumbnail_bytes(&db.conn, &image_id).unwrap();
+        reopened.set_image_loader(move |_| Ok(thumbnail.clone()));
+        assert_eq!(reopened.document(), candidate);
+        assert!(reopened.image_errors().is_empty());
+        drop(reopened);
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_image_keeps_gradient_pixels_not_just_object_count() {
+        use windows::core::Interface;
+        use windows::Win32::{
+            System::Com::{IDataObject, FORMATETC, TYMED_HGLOBAL},
+            UI::Controls::RichEdit::{IRichEditOle, REOBJECT, REO_GETOBJ_POLEOBJ},
+        };
+        let _guard = native_test_guard();
+        let parent = TestParent::new();
+        let editor =
+            NativeRichEditor::attach_to_parent(parent.0, 1.0, NativeDocument::default(), |_| {})
+                .unwrap();
+        let original = image::RgbImage::from_fn(320, 213, |x, y| {
+            image::Rgb([x as u8, y as u8, (x + y) as u8])
+        });
+        let mut png = std::io::Cursor::new(Vec::new());
+        original
+            .write_to(&mut png, image::ImageOutputFormat::Png)
+            .unwrap();
+        unsafe {
+            crate::native_image::insert_thumbnail(editor.inner.hwnd, png.get_ref()).unwrap();
+            let mut pointer: *mut std::ffi::c_void = std::ptr::null_mut();
+            SendMessageW(
+                editor.inner.hwnd,
+                1084,
+                0,
+                (&mut pointer as *mut *mut std::ffi::c_void) as super::LPARAM,
+            );
+            let ole = windows::core::IUnknown::from_raw(pointer)
+                .cast::<IRichEditOle>()
+                .unwrap();
+            let mut object = REOBJECT {
+                cbStruct: std::mem::size_of::<REOBJECT>() as u32,
+                ..Default::default()
+            };
+            ole.GetObject(0, &mut object, REO_GETOBJ_POLEOBJ).unwrap();
+            let object_interface = std::mem::ManuallyDrop::take(&mut object.poleobj).unwrap();
+            let data = object_interface.cast::<IDataObject>().unwrap();
+            let format = FORMATETC {
+                cfFormat: 8,
+                dwAspect: 1,
+                lindex: -1,
+                tymed: TYMED_HGLOBAL.0 as u32,
+                ..Default::default()
+            };
+            let mut medium = data.GetData(&format).unwrap();
+            let handle = medium.u.hGlobal.0;
+            let pointer = windows_sys::Win32::System::Memory::GlobalLock(handle);
+            let size = windows_sys::Win32::System::Memory::GlobalSize(handle);
+            let bytes = std::slice::from_raw_parts(pointer as *const u8, size).to_vec();
+            windows_sys::Win32::System::Memory::GlobalUnlock(handle);
+            windows::Win32::System::Ole::ReleaseStgMedium(&mut medium);
+            let png = crate::native_image::dib_to_png(&bytes).unwrap();
+            let actual = image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+                .unwrap()
+                .to_rgb8();
+            assert_eq!(actual.dimensions(), original.dimensions());
+            assert!(
+                actual.as_raw() == original.as_raw(),
+                "Native image pixels changed"
+            );
+        }
+    }
+
+    #[test]
+    fn native_thumbnail_is_a_real_inline_object_in_the_existing_editor() {
+        use windows::core::Interface;
+        use windows::Win32::UI::Controls::RichEdit::IRichEditOle;
+        let _guard = native_test_guard();
+        unsafe {
+            windows::Win32::System::Ole::OleInitialize(None).unwrap();
+        }
+        struct OleSession;
+        impl Drop for OleSession {
+            fn drop(&mut self) {
+                unsafe {
+                    windows::Win32::System::Ole::OleUninitialize();
+                }
+            }
+        }
+        let _ole = OleSession;
+        let parent = TestParent::new();
+        let editor = NativeRichEditor::attach_to_parent(
+            parent.0,
+            1.0,
+            NativeDocument {
+                text: "Before\nAfter".into(),
+                ..Default::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        editor.restore_selection("Before\nAfter", 7, 7);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::new(160, 120)
+            .write_to(&mut bytes, image::ImageOutputFormat::Png)
+            .unwrap();
+        unsafe {
+            crate::native_image::insert_thumbnail(editor.inner.hwnd, bytes.get_ref()).unwrap();
+            let mut pointer: *mut std::ffi::c_void = std::ptr::null_mut();
+            assert_ne!(
+                SendMessageW(
+                    editor.inner.hwnd,
+                    1084,
+                    0,
+                    (&mut pointer as *mut *mut std::ffi::c_void) as super::LPARAM
+                ),
+                0
+            );
+            assert!(!pointer.is_null());
+            let ole = windows::core::IUnknown::from_raw(pointer)
+                .cast::<IRichEditOle>()
+                .unwrap();
+            assert_eq!(ole.GetObjectCount(), 1);
+        }
     }
 
     #[test]

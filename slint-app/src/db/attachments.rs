@@ -117,14 +117,36 @@ pub fn remove(conn: &Connection, note_id: &str, id: &str) -> Result<()> {
     conn.execute("DELETE FROM attachments WHERE note_id=?1 AND id=?2 AND EXISTS(SELECT 1 FROM notes WHERE id=?1 AND deleted_at IS NULL)", params![note_id, id])?;
     cleanup_orphans(conn)
 }
+/// Only call after the editor/history has been released. Legacy attachment
+/// collections are never pruned; soft-deleted referenced images remain intact.
+pub fn retire_unplaced(conn: &Connection, note_id: &str) -> Result<()> {
+    let Some(note) = super::notes::get(conn, note_id)? else {
+        return Ok(());
+    };
+    let value: serde_json::Value = serde_json::from_str(&note.content)?;
+    if value
+        .pointer("/editor/inlineImages")
+        .and_then(|v| v.as_bool())
+        != Some(true)
+    {
+        return Ok(());
+    }
+    let referenced = crate::inline_images::content_ids(&note.content);
+    let tx = conn.unchecked_transaction()?;
+    for image in list(&tx, note_id)? {
+        if !referenced.contains(&image.id) {
+            tx.execute(
+                "DELETE FROM attachments WHERE note_id=?1 AND id=?2",
+                params![note_id, image.id],
+            )?;
+        }
+    }
+    tx.commit()?;
+    cleanup_orphans(conn)
+}
 
 pub fn thumbnail(conn: &Connection, id: &str) -> Result<slint::Image> {
-    let path = thumbnail_path(conn, id)?;
-    let mut bytes = Vec::new();
-    std::fs::File::open(path)?
-        .take(1024 * 1024 + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= 1024 * 1024, "Invalid thumbnail size");
+    let bytes = thumbnail_bytes(conn, id)?;
     let mut reader = image::io::Reader::with_format(Cursor::new(bytes), ImageFormat::Png);
     let mut limits = image::io::Limits::default();
     limits.max_image_width = Some(320);
@@ -140,13 +162,39 @@ pub fn thumbnail(conn: &Connection, id: &str) -> Result<slint::Image> {
         pixels.height(),
     )))
 }
+pub fn thumbnail_bytes(conn: &Connection, id: &str) -> Result<Vec<u8>> {
+    let path = thumbnail_path(conn, id)?;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= 1024 * 1024, "Invalid thumbnail size");
+    Ok(bytes)
+}
 
 pub fn import_image(conn: &Connection, note_id: &str, source: &Path) -> Result<Attachment> {
+    commit_prepared(conn, note_id, prepare_file(source)?, None)
+}
+pub struct PreparedImage {
+    pub item: Attachment,
+    bytes: Vec<u8>,
+    thumbnail: Vec<u8>,
+}
+pub fn prepare_file(source: &Path) -> Result<PreparedImage> {
     let file = std::fs::File::open(source)?;
     ensure!(file.metadata()?.is_file(), "Select a regular image file");
     ensure!(file.metadata()?.len() <= MAX_BYTES, "Image exceeds 20 MiB");
     let mut bytes = Vec::new();
     file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= MAX_BYTES, "Image exceeds 20 MiB");
+    let name = source
+        .file_name()
+        .context("Image name unavailable")?
+        .to_string_lossy()
+        .into_owned();
+    prepare_bytes(bytes, &name)
+}
+pub fn prepare_bytes(bytes: Vec<u8>, name: &str) -> Result<PreparedImage> {
     ensure!(bytes.len() as u64 <= MAX_BYTES, "Image exceeds 20 MiB");
     let format = image::guess_format(&bytes)?;
     let mime = match format {
@@ -177,18 +225,31 @@ pub fn import_image(conn: &Connection, note_id: &str, source: &Path) -> Result<A
         .write_to(&mut thumbnail, image::ImageOutputFormat::Png)?;
     let item = Attachment {
         id: uuid::Uuid::new_v4().to_string(),
-        name: source
-            .file_name()
-            .context("Image name unavailable")?
-            .to_string_lossy()
-            .chars()
-            .take(200)
-            .collect(),
+        name: name.chars().take(200).collect(),
         mime: mime.into(),
         bytes: bytes.len() as u64,
         width,
         height,
     };
+    Ok(PreparedImage {
+        item,
+        bytes,
+        thumbnail: thumbnail.into_inner(),
+    })
+}
+pub fn commit_prepared(
+    conn: &Connection,
+    note_id: &str,
+    prepared: PreparedImage,
+    content: Option<&str>,
+) -> Result<Attachment> {
+    let PreparedImage {
+        item,
+        bytes,
+        thumbnail,
+    } = prepared;
+    let width = item.width;
+    let height = item.height;
     let tx = conn.unchecked_transaction()?;
     let live: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM notes WHERE id=?1 AND deleted_at IS NULL)",
@@ -203,7 +264,7 @@ pub fn import_image(conn: &Connection, note_id: &str, source: &Path) -> Result<A
     let result = (|| -> Result<()> {
         for (path, data) in [
             (&original_path, bytes.as_slice()),
-            (&thumbnail_path, thumbnail.get_ref().as_slice()),
+            (&thumbnail_path, thumbnail.as_slice()),
         ] {
             let mut output = std::fs::OpenOptions::new()
                 .write(true)
@@ -214,6 +275,9 @@ pub fn import_image(conn: &Connection, note_id: &str, source: &Path) -> Result<A
             output.sync_all()?;
         }
         tx.execute("INSERT INTO attachments(id,note_id,name,mime,bytes,width,height) VALUES (?1,?2,?3,?4,?5,?6,?7)", params![item.id, note_id, item.name, item.mime, item.bytes, width, height])?;
+        if let Some(content) = content {
+            super::notes::save_content_in_transaction(&tx, note_id, content, None)?;
+        }
         tx.commit()?;
         Ok(())
     })();
@@ -231,6 +295,105 @@ pub fn import_image(conn: &Connection, note_id: &str, source: &Path) -> Result<A
 mod tests {
     use super::*;
     use crate::db::{notes, Db};
+
+    #[test]
+    fn inline_import_commits_placement_and_reopens_without_losing_originals() {
+        let directory =
+            std::env::temp_dir().join(format!("sticky-inline-{}", uuid::Uuid::new_v4()));
+        let db = Db::open_in_dir(&directory).unwrap();
+        notes::create(&db.conn, "note", r#"{"blocks":[],"plain":""}"#, "#FFF9B1").unwrap();
+        let mut bytes = Cursor::new(Vec::new());
+        image::RgbaImage::new(320, 240)
+            .write_to(&mut bytes, image::ImageOutputFormat::Png)
+            .unwrap();
+        let prepared = prepare_bytes(bytes.into_inner(), "clipboard.png").unwrap();
+        let id = prepared.item.id.clone();
+        let content = serde_json::json!({"blocks":[{"type":"text","runs":[{"t":"Before café 😀"},{"type":"image","attrs":{"attachmentId":id}},{"t":"After"}]}],"plain":"Before café 😀After","editor":{"inlineImages":true}}).to_string();
+        commit_prepared(&db.conn, "note", prepared, Some(&content)).unwrap();
+        drop(db);
+        let db = Db::open_in_dir(&directory).unwrap();
+        let note = notes::get(&db.conn, "note").unwrap().unwrap();
+        assert_eq!(
+            crate::inline_images::content_ids(&note.content),
+            vec![id.clone()]
+        );
+        assert_eq!(
+            crate::editor_state_from_content_with_checklists(&note.content).0,
+            format!("Before café 😀{}After", crate::inline_images::marker(&id))
+        );
+        assert_eq!(
+            notes::list(&db.conn, false, false, Some("Before"))
+                .unwrap()
+                .len(),
+            1
+        );
+        retire_unplaced(&db.conn, "note").unwrap();
+        assert!(thumbnail_bytes(&db.conn, &id).is_ok());
+        notes::soft_delete(&db.conn, "note").unwrap();
+        retire_unplaced(&db.conn, "note").unwrap();
+        notes::restore(&db.conn, "note").unwrap();
+        assert_eq!(
+            crate::inline_images::content_ids(
+                &notes::get(&db.conn, "note").unwrap().unwrap().content
+            ),
+            vec![id.clone()]
+        );
+        notes::create(&db.conn, "other", r#"{"blocks":[],"plain":""}"#, "#FFF9B1").unwrap();
+        assert!(notes::update_content(&db.conn, "other", &content).is_err());
+        assert!(crate::inline_images::content_ids(
+            &notes::get(&db.conn, "other").unwrap().unwrap().content
+        )
+        .is_empty());
+        // Removing the reference alone retains the file for active undo.
+        let removed = r#"{"blocks":[],"plain":"","editor":{"inlineImages":true}}"#;
+        notes::update_content(&db.conn, "note", removed).unwrap();
+        assert!(thumbnail_bytes(&db.conn, &id).is_ok());
+        notes::update_content(&db.conn, "note", &content).unwrap();
+        assert!(thumbnail_bytes(&db.conn, &id).is_ok());
+        notes::update_content(&db.conn, "note", removed).unwrap();
+        retire_unplaced(&db.conn, "note").unwrap();
+        assert!(list(&db.conn, "note").unwrap().is_empty());
+        assert!(!directory
+            .join(format!("attachments/{id}.original"))
+            .exists());
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn inline_note_failure_rolls_back_asset_files_metadata_and_placement() {
+        let directory =
+            std::env::temp_dir().join(format!("sticky-inline-rollback-{}", uuid::Uuid::new_v4()));
+        let db = Db::open_in_dir(&directory).unwrap();
+        notes::create(
+            &db.conn,
+            "note",
+            r#"{"blocks":[],"plain":"Original"}"#,
+            "#FFF9B1",
+        )
+        .unwrap();
+        let mut bytes = Cursor::new(Vec::new());
+        image::RgbaImage::new(2, 2)
+            .write_to(&mut bytes, image::ImageOutputFormat::Png)
+            .unwrap();
+        let prepared = prepare_bytes(bytes.into_inner(), "test.png").unwrap();
+        let content = serde_json::json!({"blocks":[{"type":"text","runs":[{"type":"image","attrs":{"attachmentId":prepared.item.id}}]}],"plain":"Changed"}).to_string();
+        db.conn.execute_batch("CREATE TRIGGER reject_inline_save BEFORE UPDATE OF content ON notes BEGIN SELECT RAISE(ABORT,'injected note failure'); END;").unwrap();
+        assert!(commit_prepared(&db.conn, "note", prepared, Some(&content)).is_err());
+        assert!(list(&db.conn, "note").unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_dir(directory.join("attachments"))
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(
+            notes::content_to_plain(&notes::get(&db.conn, "note").unwrap().unwrap().content),
+            "Original"
+        );
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn images_survive_text_save_delete_restore_and_database_reopen() {

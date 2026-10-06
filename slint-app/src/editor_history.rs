@@ -35,6 +35,11 @@ impl<T: Clone + PartialEq> History<T> {
         self.undo.push(std::mem::replace(&mut self.current, next));
         Some(self.current.clone())
     }
+    pub fn retained(&self) -> impl Iterator<Item = &T> {
+        std::iter::once(&self.current)
+            .chain(self.undo.iter())
+            .chain(self.redo.iter())
+    }
     fn trim(&mut self) {
         while self.undo.len() > 64
             || self.undo.iter().map(self.weight).sum::<usize>() > 4 * 1024 * 1024

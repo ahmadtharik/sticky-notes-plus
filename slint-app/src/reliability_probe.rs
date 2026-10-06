@@ -26,7 +26,14 @@ fn crash_fixture(root: &Path) -> Result<()> {
     );
     let db = Db::open_in_dir(root)?;
     notes::create(&db.conn, "durable", CONTENT, "#FFF9B1")?;
-    attachments::import_image(&db.conn, "durable", &root.join("small.png"))?;
+    let prepared = attachments::prepare_file(&root.join("small.png"))?;
+    let mut content: serde_json::Value = serde_json::from_str(CONTENT)?;
+    content["blocks"][0]["runs"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"type":"image","attrs":{"attachmentId":prepared.item.id}}));
+    content["editor"] = json!({"inlineImages":true});
+    attachments::commit_prepared(&db.conn, "durable", prepared, Some(&content.to_string()))?;
     // Create the original-file-only crash state, without committed metadata.
     std::fs::write(
         root.join("attachments/11111111-1111-4111-8111-111111111111.original"),
@@ -87,6 +94,10 @@ fn crash_roundtrip(root: &Path) -> Result<serde_json::Value> {
     );
     let items = attachments::list(&db.conn, "durable")?;
     ensure!(items.len() == 1, "Committed attachment metadata was lost");
+    ensure!(
+        crate::inline_images::content_ids(&durable.content) == vec![items[0].id.clone()],
+        "Committed inline image placement was lost"
+    );
     attachments::thumbnail(&db.conn, &items[0].id)?;
     attachments::cleanup_orphans(&db.conn)?;
     ensure!(
