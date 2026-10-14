@@ -148,6 +148,7 @@ pub fn toast_xml(row: &crate::db::reminders::ReminderRow, title: &str) -> String
 /// never manufacture an identity in the user's registry or Start menu.
 #[cfg(windows)]
 pub fn show(row: &crate::db::reminders::ReminderRow, title: &str) -> anyhow::Result<bool> {
+    use anyhow::Context;
     use windows::{
         core::HSTRING,
         Data::Xml::Dom::XmlDocument,
@@ -176,14 +177,21 @@ pub fn show(row: &crate::db::reminders::ReminderRow, title: &str) -> anyhow::Res
         }
     }
     let _apartment = Apartment(initialized.is_ok());
-    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))?;
-    if notifier.Setting()? != NotificationSetting::Enabled {
+    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))
+        .context("Create installed toast notifier")?;
+    if notifier
+        .Setting()
+        .context("Read installed toast notification setting")?
+        != NotificationSetting::Enabled
+    {
         return Ok(false);
     }
     let document = XmlDocument::new()?;
     document.LoadXml(&HSTRING::from(toast_xml(row, title)))?;
     let toast = ToastNotification::CreateToastNotification(&document)?;
-    notifier.Show(&toast)?;
+    notifier
+        .Show(&toast)
+        .context("Submit installed reminder toast")?;
     Ok(true)
 }
 
@@ -258,5 +266,7 @@ mod tests {
         let installer = include_str!("../packaging/installer.wxs");
         assert!(installer.contains(&format!("Value=\"{APP_ID}\"")));
         assert!(installer.contains("--activate &quot;%1&quot;"));
+        assert!(installer.contains("Software\\Classes\\AppUserModelId\\StickyNotesPlus.Native"));
+        assert!(installer.contains("Name=\"CustomActivator\""));
     }
 }

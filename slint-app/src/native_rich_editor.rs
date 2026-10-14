@@ -134,6 +134,7 @@ struct Inner {
     images: RefCell<HashMap<String, Vec<u8>>>,
     image_errors: RefCell<Vec<String>>,
     image_paste: RefCell<Option<Box<dyn FnMut(Result<Vec<u8>, String>)>>>,
+    focus_toolbar: RefCell<Option<Box<dyn FnMut()>>>,
 }
 
 struct TrackedNativeChip {
@@ -153,6 +154,16 @@ pub struct NativeMetrics {
 }
 
 impl Inner {
+    fn dispatch_image_paste(&self, result: Result<Vec<u8>, String>) {
+        // The callback rebuilds the control and re-enters its window procedure.
+        let callback = self.image_paste.borrow_mut().take();
+        if let Some(mut callback) = callback {
+            callback(result);
+            if self.image_paste.borrow().is_none() {
+                *self.image_paste.borrow_mut() = Some(callback);
+            }
+        }
+    }
     fn schedule_change(&self) {
         if self.pending_change.replace(true) {
             return;
@@ -200,6 +211,14 @@ pub struct NativeRichEditor {
 }
 
 impl NativeRichEditor {
+    pub fn on_focus_toolbar(&self, callback: impl FnMut() + 'static) {
+        *self.inner.focus_toolbar.borrow_mut() = Some(Box::new(callback));
+    }
+
+    pub fn focus(&self) {
+        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(self.inner.hwnd) };
+    }
+
     pub fn on_image_paste(&self, callback: impl FnMut(Result<Vec<u8>, String>) + 'static) {
         *self.inner.image_paste.borrow_mut() = Some(Box::new(callback));
     }
@@ -371,6 +390,7 @@ impl NativeRichEditor {
             images: RefCell::new(HashMap::new()),
             image_errors: RefCell::new(Vec::new()),
             image_paste: RefCell::new(None),
+            focus_toolbar: RefCell::new(None),
             task_styles: RefCell::new(Vec::new()),
             last_edit_at: Cell::new(None),
         });
@@ -662,6 +682,11 @@ impl NativeRichEditor {
     pub fn set_visible(&self, visible: bool) {
         self.inner.repaint_needed.set(visible);
         unsafe { ShowWindow(self.inner.hwnd, if visible { SW_SHOW } else { SW_HIDE }) };
+        if visible {
+            // Dismissing a Slint overlay must return keyboard input to the
+            // native child, not leave an invisible popup scope owning focus.
+            self.focus();
+        }
         unsafe {
             use windows_sys::Win32::Graphics::Gdi::{
                 RedrawWindow, RDW_ALLCHILDREN, RDW_ERASE, RDW_INVALIDATE,
@@ -805,6 +830,38 @@ unsafe extern "system" fn rich_edit_proc(
         )));
     }
     let inner = &*pointer;
+    if message == windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN
+        && wparam == windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F6 as usize
+        && !inner.composing.get()
+    {
+        // Native child input does not reach Slint's focus traversal. F6 moves
+        // to the toolbar without turning a normal text Tab into navigation.
+        let callback = inner.focus_toolbar.borrow_mut().take();
+        if let Some(mut callback) = callback {
+            callback();
+            if inner.focus_toolbar.borrow().is_none() {
+                *inner.focus_toolbar.borrow_mut() = Some(callback);
+            }
+            return 0;
+        }
+    }
+    // RichEdit handles keyboard paste internally rather than sending WM_PASTE
+    // back through our subclass. Route both standard shortcuts through the
+    // owned import path and swallow the translated Ctrl+V character once.
+    if inner.image_paste.borrow().is_some() && !inner.suppress_change.get() {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_SHIFT};
+        if is_paste_shortcut(
+            message,
+            wparam,
+            GetKeyState(VK_CONTROL as i32) < 0,
+            GetKeyState(VK_SHIFT as i32) < 0,
+        ) {
+            return SendMessageW(hwnd, WM_PASTE, 0, 0);
+        }
+        if message == WM_CHAR && wparam == 22 {
+            return 0;
+        }
+    }
     if message == WM_PASTE && inner.image_paste.borrow().is_some() && !inner.suppress_change.get() {
         match crate::native_image::clipboard_content(hwnd) {
             Ok(crate::native_image::ClipboardContent::Text(text)) => {
@@ -822,9 +879,7 @@ unsafe extern "system" fn rich_edit_proc(
                 let weak = inner.weak_self.borrow().clone();
                 slint::Timer::single_shot(Duration::ZERO, move || {
                     if let Some(inner) = weak.upgrade() {
-                        if let Some(callback) = inner.image_paste.borrow_mut().as_mut() {
-                            callback(result);
-                        }
+                        inner.dispatch_image_paste(result);
                     }
                 });
                 return 0;
@@ -1084,6 +1139,11 @@ unsafe extern "system" fn rich_edit_proc(
         }
     }
     result
+}
+
+fn is_paste_shortcut(message: u32, key: usize, control: bool, shift: bool) -> bool {
+    message == windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN
+        && ((control && key == b'V' as usize) || (shift && key == 0x2d))
 }
 
 fn document_weight(document: &NativeDocument) -> usize {
@@ -1817,6 +1877,58 @@ fn control_utf16_to_source_offset(source: &str, target: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn image_paste_callback_can_rebuild_control_without_borrowing_its_handler() {
+        let _guard = native_test_guard();
+        let parent = TestParent::new();
+        let editor =
+            NativeRichEditor::attach_to_parent(parent.0, 1.0, NativeDocument::default(), |_| {})
+                .unwrap();
+        let inner = Rc::downgrade(&editor.inner);
+        editor.on_image_paste(move |result| {
+            assert!(result.is_ok());
+            let inner = inner.upgrade().unwrap();
+            assert!(inner.image_paste.borrow().is_none());
+            unsafe {
+                super::set_document(
+                    inner.hwnd,
+                    &NativeDocument {
+                        text: "paste handled".into(),
+                        ..Default::default()
+                    },
+                );
+            }
+        });
+        editor.inner.dispatch_image_paste(Ok(Vec::new()));
+        assert!(editor.inner.image_paste.borrow().is_some());
+        assert_eq!(editor.document().text, "paste handled");
+        editor.inner.dispatch_image_paste(Ok(Vec::new()));
+        assert!(editor.inner.image_paste.borrow().is_some());
+    }
+    #[test]
+    fn keyboard_paste_shortcuts_route_to_owned_import_once() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WM_CHAR, WM_KEYDOWN, WM_KEYUP};
+        assert!(super::is_paste_shortcut(
+            WM_KEYDOWN,
+            b'V' as usize,
+            true,
+            false
+        ));
+        assert!(super::is_paste_shortcut(WM_KEYDOWN, 0x2d, false, true));
+        assert!(!super::is_paste_shortcut(WM_CHAR, 22, true, false));
+        assert!(!super::is_paste_shortcut(
+            WM_KEYUP,
+            b'V' as usize,
+            true,
+            false
+        ));
+        assert!(!super::is_paste_shortcut(
+            WM_KEYDOWN,
+            b'V' as usize,
+            false,
+            false
+        ));
+    }
     use super::{source_offset_to_control_utf16, NativeDocument, NativeRichEditor};
     use std::{cell::RefCell, rc::Rc};
     use windows_sys::Win32::{
@@ -2054,6 +2166,44 @@ mod tests {
         editor.flush_pending_change();
         assert_eq!(seen.borrow().last().unwrap().text, "界");
         assert!(!editor.inner.composing.get());
+    }
+
+    #[test]
+    fn toolbar_navigation_preserves_selection_and_defers_during_composition() {
+        let _guard = native_test_guard();
+        let parent = TestParent::new();
+        let document = NativeDocument {
+            text: "Unicode café 😀".into(),
+            ..Default::default()
+        };
+        let editor =
+            NativeRichEditor::attach_to_parent(parent.0, 1.0, document.clone(), |_| {}).unwrap();
+        editor.restore_selection(&document.text, 0, 7);
+        let visits = Rc::new(std::cell::Cell::new(0));
+        let observed = visits.clone();
+        let weak = Rc::downgrade(&editor.inner);
+        editor.on_focus_toolbar(move || {
+            let inner = weak.upgrade().unwrap();
+            assert!(inner.focus_toolbar.borrow().is_none());
+            observed.set(observed.get() + 1);
+        });
+        let navigate = || unsafe {
+            SendMessageW(
+                editor.inner.hwnd,
+                windows_sys::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
+                windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_F6 as usize,
+                0,
+            );
+        };
+        navigate();
+        navigate();
+        assert_eq!(visits.get(), 2);
+        assert_eq!(editor.selection_byte_offsets(&document.text), (0, 7));
+        editor.inner.composing.set(true);
+        navigate();
+        assert_eq!(visits.get(), 2);
+        editor.inner.composing.set(false);
+        assert_eq!(editor.document(), document);
     }
 
     #[test]
@@ -2734,6 +2884,38 @@ mod tests {
             assert_eq!(rect.right - rect.left, (180.0 * scale) as i32);
             assert_eq!(rect.bottom - rect.top, (120.0 * scale) as i32);
         }
+    }
+
+    #[test]
+    fn scale_transitions_preserve_unicode_selection_styles_and_chip_identity() {
+        let _guard = native_test_guard();
+        let parent = TestParent::new();
+        let document = NativeDocument {
+            text: "café 😀 [[date:2026-10-06]] and [[date:2026-10-06]]".into(),
+            bold: vec![(0, 5)],
+            chip_ids: vec![
+                uuid::Uuid::new_v4().to_string(),
+                uuid::Uuid::new_v4().to_string(),
+            ],
+            ..Default::default()
+        };
+        let editor =
+            NativeRichEditor::attach_to_parent(parent.0, 1.0, document.clone(), |_| {}).unwrap();
+        editor.set_layout_bounds([10.0, 20.0, 180.0, 120.0]);
+        editor.restore_selection(&document.text, 6, 10);
+        for scale in [2.0, 1.5, 1.0, 2.0, 1.0] {
+            editor.update_scale_factor(scale);
+            assert_eq!(editor.document(), document);
+            assert_eq!(editor.selection_byte_offsets(&document.text), (6, 10));
+        }
+        editor.set_visible(false);
+        editor.set_visible(true);
+        assert_eq!(editor.document(), document);
+        assert_eq!(editor.selection_byte_offsets(&document.text), (6, 10));
+        assert_eq!(
+            unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() },
+            editor.inner.hwnd
+        );
     }
 
     impl TestParent {

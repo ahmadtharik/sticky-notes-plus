@@ -50,9 +50,127 @@ pub fn dragged_position(
     )
 }
 
+pub fn drag_moved(start: PhysicalPosition, cursor: PhysicalPosition, scale: f32) -> bool {
+    let threshold = (8.0 * scale.max(1.0)).ceil() as u32;
+    start.x.abs_diff(cursor.x) >= threshold || start.y.abs_diff(cursor.y) >= threshold
+}
+
+pub fn contains(bounds: (PhysicalPosition, slint::PhysicalSize), cursor: PhysicalPosition) -> bool {
+    let (position, size) = bounds;
+    let x = i64::from(cursor.x) - i64::from(position.x);
+    let y = i64::from(cursor.y) - i64::from(position.y);
+    x >= 0 && y >= 0 && x < i64::from(size.width) && y < i64::from(size.height)
+}
+
+#[derive(Clone, Copy)]
+pub enum DropDestination {
+    IntoBoard,
+    OutOfBoard,
+}
+
+pub fn drop_allowed(
+    moved: bool,
+    eligible: bool,
+    cancelled: bool,
+    bounds: Option<(PhysicalPosition, slint::PhysicalSize)>,
+    cursor: PhysicalPosition,
+    destination: DropDestination,
+) -> bool {
+    moved
+        && eligible
+        && !cancelled
+        && bounds.is_some_and(|bounds| {
+            contains(bounds, cursor) == matches!(destination, DropDestination::IntoBoard)
+        })
+}
+
+pub fn client_bounds(window: &slint::Window) -> Option<(PhysicalPosition, slint::PhysicalSize)> {
+    use i_slint_backend_winit::WinitWindowAccessor;
+    window
+        .with_winit_window(|host| {
+            let position = host.inner_position().ok()?;
+            let size = host.inner_size();
+            Some((
+                PhysicalPosition::new(position.x, position.y),
+                slint::PhysicalSize::new(size.width, size.height),
+            ))
+        })
+        .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cancelled_clicks_hidden_boards_and_missing_bounds_never_complete_drops() {
+        let bounds = Some((
+            PhysicalPosition::new(-500, 100),
+            slint::PhysicalSize::new(400, 600),
+        ));
+        let inside = PhysicalPosition::new(-200, 200);
+        let outside = PhysicalPosition::new(20, 200);
+        for (point, destination) in [
+            (inside, DropDestination::IntoBoard),
+            (outside, DropDestination::OutOfBoard),
+        ] {
+            assert!(drop_allowed(true, true, false, bounds, point, destination));
+            assert!(!drop_allowed(
+                false,
+                true,
+                false,
+                bounds,
+                point,
+                destination
+            ));
+            assert!(!drop_allowed(
+                true,
+                false,
+                false,
+                bounds,
+                point,
+                destination
+            ));
+            assert!(!drop_allowed(true, true, true, bounds, point, destination));
+            assert!(!drop_allowed(true, true, false, None, point, destination));
+        }
+        assert!(!drop_allowed(
+            true,
+            true,
+            false,
+            bounds,
+            outside,
+            DropDestination::IntoBoard
+        ));
+        assert!(!drop_allowed(
+            true,
+            true,
+            false,
+            bounds,
+            inside,
+            DropDestination::OutOfBoard
+        ));
+    }
+    #[test]
+    fn drop_bounds_and_drag_threshold_use_physical_negative_desktop_coordinates() {
+        let bounds = (
+            PhysicalPosition::new(-500, 100),
+            slint::PhysicalSize::new(400, 600),
+        );
+        assert!(contains(bounds, PhysicalPosition::new(-500, 100)));
+        assert!(contains(bounds, PhysicalPosition::new(-101, 699)));
+        for point in [
+            PhysicalPosition::new(-501, 100),
+            PhysicalPosition::new(-100, 100),
+            PhysicalPosition::new(-500, 700),
+        ] {
+            assert!(!contains(bounds, point));
+        }
+        let start = PhysicalPosition::new(-200, 100);
+        assert!(!drag_moved(start, PhysicalPosition::new(-193, 100), 1.0));
+        assert!(drag_moved(start, PhysicalPosition::new(-192, 100), 1.0));
+        assert!(!drag_moved(start, PhysicalPosition::new(-185, 100), 2.0));
+        assert!(drag_moved(start, PhysicalPosition::new(-184, 100), 2.0));
+    }
     #[test]
     fn dragging_uses_screen_delta_even_across_negative_monitor_coordinates() {
         assert_eq!(

@@ -84,6 +84,7 @@ pub fn window_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     board.set_dark_theme(true);
     board.set_settings_open(true);
     let windows = Rc::new(RefCell::new(Vec::<EditorEntry>::new()));
+    setup_board_card_drag(&board, &db, &windows);
     let initial_ids = crate::native_projection::content_ids(
         &notes::get(&db.lock().unwrap().conn, "roundtrip")?
             .unwrap()
@@ -120,6 +121,22 @@ pub fn window_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
                     1 => {
                         let window = windows.borrow()[0].window.clone_strong();
                         geometry.set(Some(WindowGeometry::from_window(&window.window())));
+                        if cycles.get() == 0 {
+                            db.lock().unwrap().conn.execute_batch("CREATE TRIGGER reject_return_content BEFORE UPDATE OF content ON notes BEGIN SELECT RAISE(ABORT, 'acceptance save failure'); END;")?;
+                            window.invoke_return_to_board();
+                            anyhow::ensure!(window.window().is_visible() && window.get_save_status().contains("acceptance save failure"),
+                                "Failed save hid the note or suppressed its error");
+                            {
+                                let guard = db.lock().unwrap();
+                                anyhow::ensure!(editor_state_from_content_with_checklists(&notes::get(&guard.conn, "roundtrip")?.unwrap().content).0 == source,
+                                    "Rejected save partially committed input");
+                                guard.conn.execute_batch("DROP TRIGGER reject_return_content; CREATE TRIGGER reject_return_geometry BEFORE UPDATE OF is_floating ON notes BEGIN SELECT RAISE(ABORT, 'acceptance geometry failure'); END;")?;
+                            }
+                            window.invoke_return_to_board();
+                            anyhow::ensure!(window.window().is_visible() && window.get_save_status().contains("acceptance geometry failure"),
+                                "Failed geometry save hid the note");
+                            db.lock().unwrap().conn.execute_batch("DROP TRIGGER reject_return_geometry;")?;
+                        }
                         window.invoke_return_to_board();
                         anyhow::ensure!(
                             !window.window().is_visible() && board.window().is_visible(),
@@ -143,7 +160,27 @@ pub fn window_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
                             .borrow_mut()
                             .retain(|entry| entry.window.window().is_visible());
                         anyhow::ensure!(windows.borrow().is_empty(), "Hidden host retained");
-                        open_editor(&board, &db, "roundtrip", &windows);
+                        board.set_settings_open(false);
+                        if cycles.get() == 0 {
+                            for invalid in ["missing", "archived", "deleted"] {
+                                if invalid != "missing" {
+                                    let guard = db.lock().unwrap();
+                                    notes::create(&guard.conn, invalid, EMPTY_CONTENT, "#FFF9B1")?;
+                                    if invalid == "archived" { notes::update_meta(&guard.conn, invalid, None, None, Some(true))?; }
+                                    else { notes::soft_delete(&guard.conn, invalid)?; }
+                                }
+                                anyhow::ensure!(detach_note_at(&board, &db, invalid, &windows, PhysicalPosition::new(104, 96)).is_err()
+                                    && windows.borrow().is_empty(), "Stale card created an editor");
+                            }
+                        }
+                        detach_note_at(
+                            &board,
+                            &db,
+                            "roundtrip",
+                            &windows,
+                            PhysicalPosition::new(104, 96),
+                        )
+                        .map_err(|error| anyhow::anyhow!(error))?;
                     }
                     3 => {
                         let entries = windows.borrow();
@@ -152,17 +189,18 @@ pub fn window_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
                             entry.window.get_editor_text().as_str() == format!("{source}."),
                             "Reopen lost saved input"
                         );
+                        let realized = WindowGeometry::from_window(&entry.window.window());
+                        let before = geometry.get().unwrap();
                         anyhow::ensure!(
-                            WindowGeometry::from_window(&entry.window.window())
-                                == geometry.get().unwrap(),
-                            "Reopen changed geometry"
+                            realized.x == 80
+                                && realized.y == 80
+                                && realized.width == before.width
+                                && realized.height == before.height,
+                            "Drag detach lost drop position or persisted size"
                         );
-                        anyhow::ensure!(
-                            notes::get(&db.lock().unwrap().conn, "roundtrip")?
-                                .unwrap()
-                                .is_floating,
-                            "Reopen did not detach"
-                        );
+                        let saved = notes::get(&db.lock().unwrap().conn, "roundtrip")?.unwrap();
+                        anyhow::ensure!(saved.is_floating && saved.window == Some((80.0, 80.0, f64::from(before.width), f64::from(before.height))),
+                            "Detached geometry/floating state did not persist");
                         entry.window.invoke_close_note();
                         anyhow::ensure!(
                             !entry.window.window().is_visible(),
@@ -205,7 +243,7 @@ pub fn window_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     if phase.get() != 5 {
         return Err("Window probe interrupted".into());
     }
-    report.write_all(serde_json::to_string_pretty(&serde_json::json!({"return_to_board":true,"reopened_geometry":true,"pending_native_input_saved":true,"chip_ids_preserved":true,"hidden_hosts_released":true,"close_clears_floating":true,"reopen_close_cycles":cycles.get(),"database":"isolated file-backed SQLite"}))?.as_bytes())?;
+    report.write_all(serde_json::to_string_pretty(&serde_json::json!({"return_to_board":true,"reopened_size":true,"drag_detach_position_persisted":true,"stale_cards_rejected":true,"save_and_geometry_failures_keep_note_open":true,"pending_native_input_saved":true,"chip_ids_preserved":true,"hidden_hosts_released":true,"close_clears_floating":true,"reopen_close_cycles":cycles.get(),"database":"isolated file-backed SQLite"}))?.as_bytes())?;
     Ok(())
 }
 
@@ -214,7 +252,7 @@ pub fn window_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
 pub fn preview() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
     if args.len() != 3 {
-        return Err("Usage: --editor-preview <new-directory> or --editor-preview-reopen <sandbox-directory>".into());
+        return Err("Usage: --editor-preview <new-directory> or --editor-preview-reopen/--editor-preview-fallback <sandbox-directory>".into());
     }
     let path = PathBuf::from(&args[2]);
     let marker = path.join("acceptance-sandbox.txt");
@@ -225,10 +263,15 @@ pub fn preview() -> Result<(), Box<dyn std::error::Error>> {
     } else if std::fs::read_to_string(&marker)? != "sticky-native-acceptance-v1" {
         return Err("Not an editor acceptance sandbox".into());
     }
-    std::env::set_var("STICKY_NOTES_ENABLE_RICHEDIT", "1");
+    if args[1] == "--editor-preview-fallback" {
+        std::env::remove_var("STICKY_NOTES_ENABLE_RICHEDIT");
+    } else {
+        std::env::set_var("STICKY_NOTES_ENABLE_RICHEDIT", "1");
+    }
     let db = Arc::new(Mutex::new(Db::open_in_dir(&path)?));
     let board = BoardWindow::new()?;
     let windows = Rc::new(RefCell::new(Vec::<EditorEntry>::new()));
+    setup_board_card_drag(&board, &db, &windows);
     // The acceptance board uses only this marked sandbox database. Exercise
     // real reminder actions here without opening the user's production notes.
     {
@@ -321,6 +364,28 @@ pub fn preview() -> Result<(), Box<dyn std::error::Error>> {
     for row in rows {
         open_editor(&board, &db, &row.id, &windows);
     }
+    // Read-only host inventory for real mixed-monitor acceptance. Never change
+    // display settings to simulate an actual monitor transition.
+    if let Some(entry) = windows.borrow().first() {
+        entry.window.window().with_winit_window(|host| {
+            let monitors: Vec<_> = host
+                .available_monitors()
+                .map(|monitor| {
+                    serde_json::json!({
+                        "scale_factor": monitor.scale_factor(),
+                        "position": [monitor.position().x, monitor.position().y],
+                        "size": [monitor.size().width, monitor.size().height],
+                    })
+                })
+                .collect();
+            eprintln!(
+                "Acceptance display inventory: {}",
+                serde_json::json!({
+                    "host_scale_factor": host.scale_factor(), "monitors": monitors,
+                })
+            );
+        });
+    }
     let geometry_timer = Timer::default();
     {
         let windows = windows.clone();
@@ -367,15 +432,33 @@ pub fn preview() -> Result<(), Box<dyn std::error::Error>> {
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 4 || !matches!(args[2].as_str(), "1" | "20") {
+    if !(4..=5).contains(&args.len()) || !matches!(args[2].as_str(), "1" | "20") {
         return Err(
-            "Usage: --editor-probe, --editor-soak, --attachment-probe or --attachment-soak <1|20> <new-report.json>"
+            "Usage: --editor-probe, --editor-soak, --attachment-probe or --attachment-soak <1|20> <new-report.json> [soak-seconds:128..86400]"
                 .into(),
         );
     }
     let soak = matches!(args[1].as_str(), "--editor-soak" | "--attachment-soak");
     let with_images = matches!(args[1].as_str(), "--attachment-probe" | "--attachment-soak");
-    let phases = if soak { SOAK_PHASES } else { PHASES };
+    let phases = if let Some(seconds) = args.get(4) {
+        if !soak {
+            return Err("Custom duration requires a soak mode".into());
+        }
+        let seconds: u32 = seconds.parse()?;
+        if !(128..=86400).contains(&seconds) {
+            return Err("Soak duration must be between 128 seconds and 24 hours".into());
+        }
+        [
+            ("warmup", 8.0),
+            ("idle", 30.0),
+            ("typing", f64::from(seconds - 68)),
+            ("settle", 30.0),
+        ]
+    } else if soak {
+        SOAK_PHASES
+    } else {
+        PHASES
+    };
     let count: usize = args[2].parse()?;
     // Refuse to overwrite an existing report. The production database is never
     // opened, and there is no tray/hotkey registration in this isolated mode.
@@ -449,6 +532,12 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let injected = Rc::new(RefCell::new(0usize));
     let failures = Rc::new(RefCell::new(None::<String>));
     let results = Rc::new(RefCell::new(Vec::new()));
+    let samples = Rc::new(RefCell::new(Vec::new()));
+    let sample_path = PathBuf::from(&args[3]).with_extension("samples.jsonl");
+    let mut sample_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(sample_path)?;
     let timer = Timer::default();
     {
         let windows = windows.clone();
@@ -456,6 +545,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         let injected = injected.clone();
         let failures = failures.clone();
         let results = results.clone();
+        let samples = samples.clone();
+        let overall_started = Instant::now();
+        let mut next_sample = 0.0;
         let source_for_focus = source.clone();
         let mut started = Instant::now();
         let mut baseline = stats()?;
@@ -472,6 +564,18 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             let index = *phase.borrow();
             if index >= phases.len() {
                 return;
+            }
+            let total_elapsed = overall_started.elapsed().as_secs_f64();
+            if total_elapsed >= next_sample {
+                let sample = serde_json::json!({"elapsed_seconds":total_elapsed,"phase":phases[index].0,"working_set_mib":current.working_set_mib,"private_commit_mib":current.private_commit_mib,"injected_characters":*injected.borrow()});
+                let written = writeln!(sample_file, "{sample}").and_then(|_| sample_file.flush());
+                if let Err(error) = written {
+                    *failures.borrow_mut() = Some(error.to_string());
+                    let _ = slint::quit_event_loop();
+                    return;
+                }
+                samples.borrow_mut().push(sample);
+                next_sample = total_elapsed + 60.0;
             }
             peak_working_set = peak_working_set.max(current.working_set_mib);
             let elapsed = started.elapsed().as_secs_f64();
@@ -599,6 +703,8 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         "attachment_persistence_verified": with_images,
         "limitations": "No tray/hotkey timers; overlapping notes; synthetic input is not IME/visual acceptance; bounded run is not a long-duration leak test",
         "persisted_input_verified": true, "phases": &*results.borrow(),
+        "requested_duration_seconds": phases.iter().map(|phase| phase.1).sum::<f64>(),
+        "memory_samples": &*samples.borrow(),
     });
     report.write_all(serde_json::to_string_pretty(&payload)?.as_bytes())?;
     report.flush()?;

@@ -140,17 +140,25 @@ component NoteAction inherits Rectangle {
     in property <image> icon;
     in property <length> text-size: 16px;
     callback clicked();
+    callback focus-editor();
+    in property <bool> keyboard-editor-navigation: false;
+    public function focus-action() { keyboard.focus(); }
     min-width: 0px;
     preferred-width: 30px;
     background: hit.has-hover || keyboard.has-focus ? #00000012 : transparent;
+    border-width: keyboard.has-focus ? 1px : 0px;
+    border-color: foreground;
     accessible-role: button;
     accessible-label: label;
+    accessible-enabled: action-enabled;
     accessible-action-default => { if (root.action-enabled) { root.clicked(); } }
     forward-focus: keyboard;
     keyboard := FocusScope {
+        enabled: root.action-enabled;
         width: parent.width;
         height: parent.height;
         key-pressed(event) => {
+            if (root.keyboard-editor-navigation && event.text == Key.F6) { root.focus-editor(); return accept; }
             if (root.action-enabled && (event.text == Key.Return || event.text == Key.Space)) { root.clicked(); return accept; }
             reject
         }
@@ -266,6 +274,13 @@ export component BoardWindow inherits Window {
     callback select-board-view(string);
     callback create-note();
     callback open-note(string);
+    callback begin-card-drag(string);
+    callback move-card-drag() -> bool;
+    callback end-card-drag(bool) -> bool;
+    in-out property <bool> note-drop-active: false;
+    in-out property <bool> card-drag-active: false;
+    in-out property <string> window-status;
+    property <bool> card-click-suppressed: false;
     callback delete-note(string);
     callback archive-note(string, bool);
     callback restore-note(string);
@@ -284,7 +299,7 @@ export component BoardWindow inherits Window {
         HorizontalLayout {
             spacing: 12px;
             NoteAction { text: "+"; label: "New note"; foreground: root.board-foreground; width: 32px; height: 36px; clicked => { root.create-note(); } }
-            Text { text: "Sticky Notes"; font-size: 24px; font-weight: 600; color: root.board-foreground; vertical-alignment: center; }
+            Text { text: root.note-drop-active ? "Drop note here" : root.card-drag-active ? "Release outside to open" : "Sticky Notes"; font-size: root.note-drop-active || root.card-drag-active ? 16px : 24px; font-weight: 600; color: root.board-foreground; vertical-alignment: center; }
             Rectangle { horizontal-stretch: 1; }
             NoteAction { has-icon: true; icon: @image-url("icons/settings.svg"); label: "Settings and additional views"; foreground: root.board-foreground; width: 36px; height: 36px; clicked => { root.navigation-open = !root.navigation-open; } }
         }
@@ -324,39 +339,39 @@ export component BoardWindow inherits Window {
             Button { text: "Dismiss"; clicked => { root.reminder-error = ""; } }
         }
         if root.reminder-panel-open && due-reminders.length > 0: Rectangle {
-            height: root.settings-open ? 80px : 116px;
+            height: root.settings-open ? 150px : min(240px, root.height * 0.38);
             background: #fff7d6;
             border-width: 1px;
             border-color: #d8bc63;
             border-radius: 10px;
-            padding: 8px;
+            clip: true;
             VerticalLayout {
-                spacing: 4px;
+                padding: 12px;
+                spacing: 10px;
                 Text {
-                    text: "Due reminders — act now or clear them";
-                    font-size: 12px;
+                    text: "Due reminders";
+                    font-size: 14px;
                     font-weight: 700;
                     color: #66521b;
                 }
                 ScrollView {
                     viewport-width: self.visible-width;
                     VerticalLayout {
-                    spacing: 4px;
+                    spacing: 10px;
                     for reminder in due-reminders: Rectangle {
-                        height: 34px;
+                        height: 112px;
                         min-width: 0px;
                         horizontal-stretch: 1;
                         background: #ffffff99;
                         border-radius: 6px;
-                        HorizontalLayout {
-                            padding-left: 7px;
-                            padding-right: 4px;
-                            spacing: 6px;
+                        VerticalLayout {
+                            padding: 10px;
+                            spacing: 7px;
                             Text {
                                 text: reminder.title == "" ? "Untitled note" : reminder.title;
                                 color: #66521b;
-                                width: 90px;
-                                font-size: 12px;
+                                min-width: 0px;
+                                font-size: 13px;
                                 font-weight: 700;
                                 overflow: elide;
                                 vertical-alignment: center;
@@ -365,13 +380,18 @@ export component BoardWindow inherits Window {
                                 text: reminder.label == "" ? reminder.due-label : reminder.label + " · " + reminder.due-label;
                                 horizontal-stretch: 1;
                                 color: #695b35;
-                                font-size: 11px;
+                                min-width: 0px;
+                                font-size: 12px;
                                 overflow: elide;
                                 vertical-alignment: center;
                             }
-                            Button { text: "Done"; clicked => { root.complete-reminder(reminder.id); } }
-                            Button { text: "10m"; clicked => { root.snooze-reminder(reminder.id); } }
-                            Button { text: "Dismiss"; clicked => { root.dismiss-reminder(reminder.id); } }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                height: 32px;
+                                Button { text: "Done"; min-width: 0px; horizontal-stretch: 1; clicked => { root.complete-reminder(reminder.id); } }
+                                Button { text: "Snooze 10m"; min-width: 0px; horizontal-stretch: 1; clicked => { root.snooze-reminder(reminder.id); } }
+                                Button { text: "Dismiss"; min-width: 0px; horizontal-stretch: 1; clicked => { root.dismiss-reminder(reminder.id); } }
+                            }
                         }
                     }
                     }
@@ -399,11 +419,16 @@ export component BoardWindow inherits Window {
                 Button { text: "Delete forever"; clicked => { root.confirm-purge(root.pending-purge-id); } }
             }
         }
+        if root.window-status != "": HorizontalLayout {
+            Text { text: root.window-status; color: #ab2e26; wrap: word-wrap; horizontal-stretch: 1; }
+            Button { text: "Dismiss"; clicked => { root.window-status = ""; } }
+        }
         ScrollView {
             viewport-width: self.visible-width;
             VerticalLayout {
                 spacing: 10px;
             for card in notes: Rectangle {
+                clip: true;
                 background: card.color;
                 border-radius: 3px;
                 border-width: 1px;
@@ -411,7 +436,24 @@ export component BoardWindow inherits Window {
                 horizontal-stretch: 1;
                 min-width: 0px;
                 height: root.card-menu-id == card.id ? 152px : 112px;
-                TouchArea { enabled: root.board-view != "deleted"; clicked => { root.open-note(card.id); } }
+                TouchArea {
+                    enabled: root.board-view != "deleted";
+                    pointer-event(event) => {
+                        if (event.kind == PointerEventKind.cancel) {
+                            root.card-click-suppressed = root.end-card-drag(true);
+                        } else if (event.button == PointerEventButton.left) {
+                            if (event.kind == PointerEventKind.down) {
+                                root.card-click-suppressed = false;
+                                root.begin-card-drag(card.id);
+                            }
+                            if (event.kind == PointerEventKind.up) {
+                                root.card-click-suppressed = root.end-card-drag(false);
+                            }
+                        }
+                    }
+                    moved => { if (self.pressed) { root.card-click-suppressed = root.move-card-drag(); } }
+                    clicked => { if (!root.card-click-suppressed) { root.open-note(card.id); } }
+                }
                 VerticalLayout {
                     padding: 16px;
                     spacing: 8px;
@@ -525,7 +567,7 @@ export component NoteWindow inherits Window {
     callback create-note();
     callback begin-drag();
     callback move-drag();
-    callback end-drag();
+    callback end-drag(bool);
     callback close-note();
     callback open-board();
     callback return-to-board();
@@ -533,6 +575,8 @@ export component NoteWindow inherits Window {
     callback insert-date-chip();
     callback toggle-date-panel();
     callback set-native-editor-visible(bool);
+    callback focus-native-editor();
+    public function focus-toolbar() { bold-action.focus-action(); }
     callback editor-history-action(bool);
     callback select-date-occurrence(int);
     callback apply-date-selection();
@@ -598,9 +642,11 @@ export component NoteWindow inherits Window {
                     horizontal-stretch: 1;
                     height: 32px;
                     pointer-event(event) => {
-                        if (event.button == PointerEventButton.left) {
+                        if (event.kind == PointerEventKind.cancel) {
+                            root.end-drag(true);
+                        } else if (event.button == PointerEventButton.left) {
                             if (event.kind == PointerEventKind.down) { root.begin-drag(); }
-                            if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) { root.end-drag(); }
+                            if (event.kind == PointerEventKind.up) { root.end-drag(false); }
                         }
                     }
                     moved => { if (self.pressed) { root.move-drag(); } }
@@ -705,14 +751,14 @@ export component NoteWindow inherits Window {
             HorizontalLayout {
                 height: 40px;
                 spacing: 0px;
-                NoteAction { action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "B"; label: "Bold"; emphasis: true; width: 32px; clicked => { root.toggle-selection-style("bold", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
-                NoteAction { action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "I"; italic: true; label: "Italic"; width: 32px; clicked => { root.toggle-selection-style("italic", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
-                NoteAction { action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "U̲"; label: "Underline"; width: 32px; clicked => { root.toggle-selection-style("underline", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
-                NoteAction { action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "a̶b̶"; label: "Strikethrough"; width: 32px; clicked => { root.toggle-selection-style("strike", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
-                NoteAction { action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/list.svg"); label: "Bullet list"; width: 32px; clicked => { editor-input.apply-list("bullet"); } }
-                NoteAction { action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/image.svg"); label: "Add image"; width: 32px; clicked => { root.add-image(); } }
-                NoteAction { action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/checklist.svg"); label: "Checklist"; width: 32px; clicked => { editor-input.apply-list("checklist"); } }
-                NoteAction { action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/calendar.svg"); label: "Date picker"; width: 32px; clicked => { root.toggle-date-panel(); } }
+                bold-action := NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "B"; label: "Bold"; emphasis: true; width: 32px; clicked => { root.toggle-selection-style("bold", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "I"; italic: true; label: "Italic"; width: 32px; clicked => { root.toggle-selection-style("italic", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "U̲"; label: "Underline"; width: 32px; clicked => { root.toggle-selection-style("underline", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "a̶b̶"; label: "Strikethrough"; width: 32px; clicked => { root.toggle-selection-style("strike", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/list.svg"); label: "Bullet list"; width: 32px; clicked => { editor-input.apply-list("bullet"); } }
+                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/image.svg"); label: "Add image"; width: 32px; clicked => { root.add-image(); } }
+                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/checklist.svg"); label: "Checklist"; width: 32px; clicked => { editor-input.apply-list("checklist"); } }
+                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/calendar.svg"); label: "Date picker"; width: 32px; clicked => { root.toggle-date-panel(); } }
                 Rectangle { horizontal-stretch: 1; }
             }
             if root.save-error: HorizontalLayout {
@@ -826,8 +872,8 @@ export component NoteWindow inherits Window {
                     }
                 }
                 HorizontalLayout {
-                    LineEdit { text <=> root.date-input; placeholder-text: "YYYY-MM-DD"; horizontal-stretch: 1; }
-                    LineEdit { text <=> root.date-time-input; placeholder-text: "HH:mm (optional)"; width: 115px; }
+                    LineEdit { text <=> root.date-input; placeholder-text: "YYYY-MM-DD"; accessible-label: "Date"; min-width: 0px; horizontal-stretch: 1; }
+                    LineEdit { text <=> root.date-time-input; placeholder-text: "HH:mm"; accessible-label: "Time (optional)"; width: 80px; }
                 }
                 HorizontalLayout {
                     spacing: 3px;

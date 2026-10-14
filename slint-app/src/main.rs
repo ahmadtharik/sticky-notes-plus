@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod acceptance_profile;
 mod checklist_presentation;
 mod content_identity;
 mod date_picker;
@@ -144,7 +145,12 @@ struct DueReminder {
     due_label: String,
 }
 
+static ACCEPTANCE_DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
 fn app_data_dir() -> PathBuf {
+    if let Some(path) = ACCEPTANCE_DATA_DIR.get() {
+        return path.clone();
+    }
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
@@ -1822,7 +1828,7 @@ fn surface_unannounced_due(board: &BoardWindow, db: &Arc<Mutex<Db>>) {
                     .unwrap_or_default();
                 match notification::show(&row, &title) {
                     Ok(shown) => delivered = shown,
-                    Err(error) => eprintln!("Windows reminder delivery unavailable: {error}"),
+                    Err(error) => eprintln!("Windows reminder delivery unavailable: {error:#}"),
                 }
             }
             if delivered {
@@ -1841,6 +1847,118 @@ fn surface_unannounced_due(board: &BoardWindow, db: &Arc<Mutex<Db>>) {
             }
         }
     }
+}
+
+#[cfg(windows)]
+fn board_accepts_note_drop(board: &BoardWindow) -> bool {
+    board.window().is_visible()
+        && board.get_board_view() == "notes"
+        && !board.get_settings_open()
+        && board.get_pending_purge_id().is_empty()
+}
+
+#[cfg(windows)]
+fn detach_note_at(
+    board: &BoardWindow,
+    db: &Arc<Mutex<Db>>,
+    id: &str,
+    windows: &Rc<RefCell<Vec<EditorEntry>>>,
+    cursor: PhysicalPosition,
+) -> Result<(), String> {
+    let valid = notes::get(&db.lock().unwrap().conn, id)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|note| note.deleted_at.is_none() && !note.is_archived);
+    if !valid {
+        return Err("This note is no longer available in the notes list.".into());
+    }
+    open_editor(board, db, id, windows);
+    let window = windows
+        .borrow()
+        .iter()
+        .find(|entry| entry.id == id)
+        .map(|entry| entry.window.clone_strong())
+        .ok_or_else(|| "Could not open the detached note.".to_string())?;
+    let position = PhysicalPosition::new(cursor.x.saturating_sub(24), cursor.y.saturating_sub(16));
+    window.window().set_position(position);
+    let geometry = WindowGeometry::from_window(window.window());
+    notes::save_window_geom(
+        &db.lock().unwrap().conn,
+        id,
+        f64::from(position.x),
+        f64::from(position.y),
+        f64::from(geometry.width),
+        f64::from(geometry.height),
+        true,
+    )
+    .map_err(|error| format!("Note opened, but its position could not be saved: {error}"))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn setup_board_card_drag(
+    board: &BoardWindow,
+    db: &Arc<Mutex<Db>>,
+    windows: &Rc<RefCell<Vec<EditorEntry>>>,
+) {
+    let origin = Rc::new(RefCell::new(None::<(String, PhysicalPosition, bool)>));
+    let begin_origin = origin.clone();
+    let weak = board.as_weak();
+    board.on_begin_card_drag(move |id| {
+        *begin_origin.borrow_mut() = None;
+        if let Some(board) = weak.upgrade() {
+            board.set_card_drag_active(false);
+            if board_accepts_note_drop(&board) {
+                if let Some(cursor) = window_chrome::cursor_position() {
+                    *begin_origin.borrow_mut() = Some((id.to_string(), cursor, false));
+                }
+            }
+        }
+    });
+    let move_origin = origin.clone();
+    let weak = board.as_weak();
+    board.on_move_card_drag(move || {
+        let Some(board) = weak.upgrade() else {
+            return false;
+        };
+        let mut state = move_origin.borrow_mut();
+        let Some((_, start, moved)) = state.as_mut() else {
+            return false;
+        };
+        if let Some(cursor) = window_chrome::cursor_position() {
+            *moved |= window_chrome::drag_moved(*start, cursor, board.window().scale_factor());
+        }
+        board.set_card_drag_active(*moved);
+        *moved
+    });
+    let weak = board.as_weak();
+    let db = db.clone();
+    let windows = windows.clone();
+    board.on_end_card_drag(move |cancelled| {
+        let state = origin.borrow_mut().take();
+        let Some(board) = weak.upgrade() else {
+            return true;
+        };
+        board.set_card_drag_active(false);
+        let Some((id, start, mut moved)) = state else {
+            return false;
+        };
+        if let Some(cursor) = window_chrome::cursor_position() {
+            moved |= window_chrome::drag_moved(start, cursor, board.window().scale_factor());
+            if window_chrome::drop_allowed(
+                moved,
+                board_accepts_note_drop(&board),
+                cancelled,
+                window_chrome::client_bounds(board.window()),
+                cursor,
+                window_chrome::DropDestination::OutOfBoard,
+            ) {
+                if let Err(error) = detach_note_at(&board, &db, &id, &windows, cursor) {
+                    board.set_window_status(error.into());
+                }
+            }
+        }
+        moved
+    });
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -1874,14 +1992,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     if matches!(
         std::env::args().nth(1).as_deref(),
-        Some("--editor-preview" | "--editor-preview-reopen")
+        Some("--editor-preview" | "--editor-preview-reopen" | "--editor-preview-fallback")
     ) {
         return editor_probe::preview();
     }
-    let background_launch = std::env::args().nth(1).as_deref() == Some("--background");
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.get(1).map(String::as_str) == Some("--acceptance-init") {
+        if raw_args.len() != 3 {
+            return Err("Usage: --acceptance-init <new-directory>".into());
+        }
+        acceptance_profile::initialize(std::path::Path::new(&raw_args[2]))?;
+        return Ok(());
+    }
+    let (args, acceptance_path) = acceptance_profile::parse(raw_args)?;
+    if let Some(path) = acceptance_path {
+        ACCEPTANCE_DATA_DIR
+            .set(path)
+            .map_err(|_| "Acceptance profile already configured")?;
+    }
+    let background_launch = args.get(1).map(String::as_str) == Some("--background");
     #[cfg(windows)]
     let instance = {
-        let args: Vec<_> = std::env::args().collect();
         let command = if args.get(1).map(String::as_str) == Some("--activate") {
             if args.len() != 3 || notification::Activation::parse(&args[2]).is_none() {
                 return Err("Invalid reminder activation".into());
@@ -2013,6 +2144,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let board_weak = board.as_weak();
     let editor_windows: Rc<RefCell<Vec<EditorEntry>>> = Rc::new(RefCell::new(Vec::new()));
+    #[cfg(windows)]
+    setup_board_card_drag(&board, &db, &editor_windows);
     refresh(&board, &db, "");
     // Evaluate immediately rather than making the user wait for the first
     // timer tick after launch.
@@ -2703,6 +2836,12 @@ fn open_editor(
             }
         });
         let native_for_history = native_editor_slot.clone();
+        let native_for_focus = native_editor_slot.clone();
+        editor.on_focus_native_editor(move || {
+            if let Some(native) = native_for_focus.borrow().as_ref() {
+                native.focus();
+            }
+        });
         editor.on_editor_history_action(move |redo| {
             if let Some(native) = native_for_history.borrow().as_ref() {
                 native.history_action(redo);
@@ -2804,12 +2943,16 @@ fn open_editor(
         let drag_origin = Rc::new(RefCell::new(None));
         let weak = weak_editor.clone();
         let origin = drag_origin.clone();
+        let drag_board = board.as_weak();
         editor.on_begin_drag(move || {
             if let (Some(window), Some(cursor)) = (weak.upgrade(), window_chrome::cursor_position())
             {
                 let geometry = WindowGeometry::from_window(window.window());
                 *origin.borrow_mut() =
                     Some((PhysicalPosition::new(geometry.x, geometry.y), cursor));
+                if let Some(board) = drag_board.upgrade() {
+                    board.set_note_drop_active(board_accepts_note_drop(&board));
+                }
             }
         });
         let weak = weak_editor.clone();
@@ -2825,8 +2968,27 @@ fn open_editor(
                     .set_position(window_chrome::dragged_position(position, start, cursor));
             }
         });
-        editor.on_end_drag(move || {
-            *drag_origin.borrow_mut() = None;
+        let weak = weak_editor.clone();
+        let drag_board = board.as_weak();
+        editor.on_end_drag(move |cancelled| {
+            let origin = drag_origin.borrow_mut().take();
+            if let Some(board) = drag_board.upgrade() {
+                board.set_note_drop_active(false);
+                if let (Some(window), Some((_, start)), Some(cursor)) =
+                    (weak.upgrade(), origin, window_chrome::cursor_position())
+                {
+                    if window_chrome::drop_allowed(
+                        window_chrome::drag_moved(start, cursor, window.window().scale_factor()),
+                        board_accepts_note_drop(&board),
+                        cancelled,
+                        window_chrome::client_bounds(board.window()),
+                        cursor,
+                        window_chrome::DropDestination::IntoBoard,
+                    ) {
+                        window.invoke_return_to_board();
+                    }
+                }
+            }
         });
     }
     let weak_close = weak_editor.clone();
@@ -3486,6 +3648,20 @@ fn open_editor(
                         flush_editor(db, id, &editor, &save_state, &weak_board);
                     }
                     let clicked_window = editor.as_weak();
+                    let toolbar_window = editor.as_weak();
+                    native.on_focus_toolbar(move || {
+                        if let Some(window) = toolbar_window.upgrade() {
+                            window.window().with_winit_window(|host| {
+                                use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                                if let Ok(handle) = host.window_handle() {
+                                    if let RawWindowHandle::Win32(handle) = handle.as_raw() {
+                                        unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::SetFocus(handle.hwnd.get() as _) };
+                                    }
+                                }
+                            });
+                            window.invoke_focus_toolbar();
+                        }
+                    });
                     let checkbox_window = editor.as_weak();
                     native.on_checklist_clicked(move |line, checked| {
                         if let Some(window) = checkbox_window.upgrade() {
