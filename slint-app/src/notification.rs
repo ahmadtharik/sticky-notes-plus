@@ -179,12 +179,12 @@ pub fn show(row: &crate::db::reminders::ReminderRow, title: &str) -> anyhow::Res
     let _apartment = Apartment(initialized.is_ok());
     let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))
         .context("Create installed toast notifier")?;
-    if notifier
-        .Setting()
-        .context("Read installed toast notification setting")?
-        != NotificationSetting::Enabled
-    {
-        return Ok(false);
+    match notifier.Setting() {
+        Ok(NotificationSetting::Enabled) => (),
+        Ok(_) => return Ok(false),
+        // This query can be unavailable for an otherwise valid unpackaged
+        // desktop identity. `Show` is the authoritative delivery attempt.
+        Err(error) => eprintln!("Windows notification setting unavailable: {error}"),
     }
     let document = XmlDocument::new()?;
     document.LoadXml(&HSTRING::from(toast_xml(row, title)))?;
@@ -266,7 +266,9 @@ mod tests {
         let installer = include_str!("../packaging/installer.wxs");
         assert!(installer.contains(&format!("Value=\"{APP_ID}\"")));
         assert!(installer.contains("--activate &quot;%1&quot;"));
-        assert!(installer.contains("Software\\Classes\\AppUserModelId\\StickyNotesPlus.Native"));
-        assert!(installer.contains("Name=\"CustomActivator\""));
+        assert!(
+            !installer.contains("ShortcutProperty Key=\"System.AppUserModel.ToastActivatorCLSID\"")
+        );
+        assert!(!installer.contains("Name=\"CustomActivator\""));
     }
 }

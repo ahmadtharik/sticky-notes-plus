@@ -43,6 +43,34 @@ pub fn load(conn: &Connection) -> anyhow::Result<Preferences> {
     Ok(value)
 }
 
+/// Board placement (x, y, width, height in physical pixels). Kept apart from
+/// `Preferences` so frequent moves never touch startup registration.
+pub fn load_board_geometry(conn: &Connection) -> anyhow::Result<Option<(f64, f64, f64, f64)>> {
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key='board_window'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(match raw {
+        Some(raw) => {
+            let [x, y, width, height] = serde_json::from_str::<[f64; 4]>(&raw)?;
+            Some((x, y, width, height))
+        }
+        None => None,
+    })
+}
+
+pub fn save_board_geometry(
+    conn: &Connection,
+    geometry: (f64, f64, f64, f64),
+) -> anyhow::Result<()> {
+    let (x, y, width, height) = geometry;
+    conn.execute("INSERT INTO meta(key,value) VALUES('board_window',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [serde_json::to_string(&[x, y, width, height])?])?;
+    Ok(())
+}
+
 pub fn apply(
     conn: &Connection,
     previous: &Preferences,
@@ -162,6 +190,18 @@ mod tests {
         })
         .unwrap();
         assert_eq!(load(&conn).unwrap(), next);
+    }
+    #[test]
+    fn board_geometry_roundtrips_without_touching_preferences() {
+        let conn = db();
+        assert_eq!(load_board_geometry(&conn).unwrap(), None);
+        save_board_geometry(&conn, (-1200.0, 40.0, 420.0, 640.0)).unwrap();
+        save_board_geometry(&conn, (-1180.0, 60.0, 400.0, 620.0)).unwrap();
+        assert_eq!(
+            load_board_geometry(&conn).unwrap(),
+            Some((-1180.0, 60.0, 400.0, 620.0))
+        );
+        assert_eq!(load(&conn).unwrap(), Preferences::default());
     }
     #[test]
     fn failed_startup_registration_rolls_back_settings() {

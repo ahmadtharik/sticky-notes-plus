@@ -1793,6 +1793,96 @@ fn refresh_due_reminders(board: &BoardWindow, db: &Arc<Mutex<Db>>) {
     board.set_due_reminders(ModelRc::new(VecModel::from(cards)));
 }
 
+/// softbuffer's Win32 backend reports its retained buffer as current after the
+/// board was hidden, so Slint's partial renderer would repaint nothing over the
+/// cleared window. Changing a background dependency forces a full frame.
+fn show_board(board: &BoardWindow) -> Result<(), slint::PlatformError> {
+    board.show()?;
+    board.set_repaint_epoch((board.get_repaint_epoch() + 1) % 2);
+    #[cfg(windows)]
+    if let Some(geometry) = BOARD_RESTORE.with(|pending| pending.borrow_mut().take()) {
+        restore_board_geometry(board, geometry);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// Saved board placement, applied on the first show: like editors, a
+    /// pre-show request can be replaced by Winit's creation defaults, and a
+    /// background launch may not show the board until much later.
+    static BOARD_RESTORE: RefCell<Option<WindowGeometry>> = const { RefCell::new(None) };
+}
+
+#[cfg(windows)]
+fn restore_board_geometry(board: &BoardWindow, geometry: WindowGeometry) {
+    let monitors = board
+        .window()
+        .with_winit_window(|host| {
+            host.available_monitors()
+                .map(|monitor| {
+                    let (position, size) = (monitor.position(), monitor.size());
+                    (
+                        PhysicalPosition::new(position.x, position.y),
+                        PhysicalSize::new(size.width, size.height),
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let position = PhysicalPosition::new(geometry.x, geometry.y);
+    if window_chrome::title_on_monitor(position, geometry.width, &monitors) {
+        geometry.apply(board.window());
+    } else {
+        // Its monitor is gone: keep the size, let Windows place the window.
+        board
+            .window()
+            .set_size(PhysicalSize::new(geometry.width, geometry.height));
+    }
+}
+
+/// Persist board moves and resizes, debounced so a drag writes once.
+#[cfg(windows)]
+fn track_board_geometry(board: &BoardWindow, db: &Arc<Mutex<Db>>) {
+    let timer = Rc::new(Timer::default());
+    let weak = board.as_weak();
+    let db = db.clone();
+    board.window().on_winit_window_event(move |_, event| {
+        use i_slint_backend_winit::winit::event::WindowEvent;
+        if matches!(event, WindowEvent::Moved(_) | WindowEvent::Resized(_)) {
+            let weak = weak.clone();
+            let db = db.clone();
+            timer.start(
+                TimerMode::SingleShot,
+                Duration::from_millis(500),
+                move || {
+                    let Some(board) = weak.upgrade() else {
+                        return;
+                    };
+                    let minimized = board
+                        .window()
+                        .with_winit_window(|host| host.is_minimized().unwrap_or(false))
+                        .unwrap_or(true);
+                    if minimized || !board.window().is_visible() {
+                        return;
+                    }
+                    let geometry = WindowGeometry::from_window(board.window());
+                    let _ = settings::save_board_geometry(
+                        &db.lock().unwrap().conn,
+                        (
+                            f64::from(geometry.x),
+                            f64::from(geometry.y),
+                            f64::from(geometry.width),
+                            f64::from(geometry.height),
+                        ),
+                    );
+                },
+            );
+        }
+        WinitWindowEventResult::Propagate
+    });
+}
+
 /// Surface newly due reminders once per occurrence, including after the app
 /// wakes or starts with overdue notes. The board is the reliable action
 /// surface until an installed Windows toast identity is available.
@@ -1840,7 +1930,7 @@ fn surface_unannounced_due(board: &BoardWindow, db: &Arc<Mutex<Db>>) {
     }
     if !fallback.is_empty() {
         board.set_reminder_panel_open(true);
-        if board.show().is_ok() {
+        if show_board(board).is_ok() {
             let guard = db.lock().expect("database lock poisoned");
             for row in fallback {
                 let _ = reminders::mark_announced(&guard.conn, &row);
@@ -1895,16 +1985,55 @@ fn detach_note_at(
 }
 
 #[cfg(windows)]
+thread_local! {
+    /// Read by the backend's window-attributes hook for the next window only.
+    /// The drag preview must not take activation, or the board's pointer
+    /// capture would end mid-drag. Winit only honours this on a first show,
+    /// hence one new preview window per drag.
+    static NEXT_WINDOW_INACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(windows)]
+fn drag_ghost_position(cursor: PhysicalPosition) -> PhysicalPosition {
+    // Same offset detach_note_at uses, so the preview shows where it lands.
+    PhysicalPosition::new(cursor.x.saturating_sub(24), cursor.y.saturating_sub(16))
+}
+
+#[cfg(windows)]
+fn show_drag_ghost(
+    board: &BoardWindow,
+    id: &str,
+    cursor: PhysicalPosition,
+) -> Option<DragGhostWindow> {
+    let card = board.get_notes().iter().find(|card| card.id == id)?;
+    NEXT_WINDOW_INACTIVE.with(|flag| flag.set(true));
+    let ghost = DragGhostWindow::new();
+    NEXT_WINDOW_INACTIVE.with(|flag| flag.set(false));
+    let ghost = ghost.ok()?;
+    ghost.set_title_text(card.title);
+    ghost.set_card_color(card.color);
+    ghost.window().set_position(drag_ghost_position(cursor));
+    ghost.show().ok()?;
+    ghost.window().set_position(drag_ghost_position(cursor));
+    Some(ghost)
+}
+
+#[cfg(windows)]
 fn setup_board_card_drag(
     board: &BoardWindow,
     db: &Arc<Mutex<Db>>,
     windows: &Rc<RefCell<Vec<EditorEntry>>>,
 ) {
     let origin = Rc::new(RefCell::new(None::<(String, PhysicalPosition, bool)>));
+    let ghost = Rc::new(RefCell::new(None::<DragGhostWindow>));
     let begin_origin = origin.clone();
+    let begin_ghost = ghost.clone();
     let weak = board.as_weak();
     board.on_begin_card_drag(move |id| {
         *begin_origin.borrow_mut() = None;
+        if let Some(stale) = begin_ghost.borrow_mut().take() {
+            let _ = stale.hide();
+        }
         if let Some(board) = weak.upgrade() {
             board.set_card_drag_active(false);
             if board_accepts_note_drop(&board) {
@@ -1915,17 +2044,25 @@ fn setup_board_card_drag(
         }
     });
     let move_origin = origin.clone();
+    let move_ghost = ghost.clone();
     let weak = board.as_weak();
     board.on_move_card_drag(move || {
         let Some(board) = weak.upgrade() else {
             return false;
         };
         let mut state = move_origin.borrow_mut();
-        let Some((_, start, moved)) = state.as_mut() else {
+        let Some((id, start, moved)) = state.as_mut() else {
             return false;
         };
         if let Some(cursor) = window_chrome::cursor_position() {
             *moved |= window_chrome::drag_moved(*start, cursor, board.window().scale_factor());
+            if *moved {
+                let mut ghost = move_ghost.borrow_mut();
+                match ghost.as_ref() {
+                    Some(window) => window.window().set_position(drag_ghost_position(cursor)),
+                    None => *ghost = show_drag_ghost(&board, id, cursor),
+                }
+            }
         }
         board.set_card_drag_active(*moved);
         *moved
@@ -1934,6 +2071,9 @@ fn setup_board_card_drag(
     let db = db.clone();
     let windows = windows.clone();
     board.on_end_card_drag(move |cancelled| {
+        if let Some(window) = ghost.borrow_mut().take() {
+            let _ = window.hide();
+        }
         let state = origin.borrow_mut().take();
         let Some(board) = weak.upgrade() else {
             return true;
@@ -1977,6 +2117,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if std::env::var_os("SLINT_BACKEND").is_none() {
         std::env::set_var("SLINT_BACKEND", "winit-software");
+    }
+    // Same backend the variable selects, plus a hook so the drag preview can
+    // open without activation.
+    #[cfg(windows)]
+    if std::env::var("SLINT_BACKEND").as_deref() == Ok("winit-software") {
+        use i_slint_backend_winit::winit::platform::windows::WindowAttributesExtWindows;
+        let backend = i_slint_backend_winit::Backend::builder()
+            .with_renderer_name("software")
+            .with_window_attributes_hook(|attributes| {
+                if NEXT_WINDOW_INACTIVE.with(|flag| flag.replace(false)) {
+                    attributes.with_active(false).with_skip_taskbar(true)
+                } else {
+                    attributes
+                }
+            })
+            .build()?;
+        slint::platform::set_platform(Box::new(backend)).map_err(|error| error.to_string())?;
     }
     #[cfg(windows)]
     if std::env::args().nth(1).as_deref() == Some("--window-probe") {
@@ -2042,7 +2199,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             format!("Could not load settings: {error}. Existing settings were preserved."),
         ),
     };
-    board.set_dark_theme(preferences.dark_theme);
+    board.invoke_apply_theme(preferences.dark_theme);
+    #[cfg(windows)]
+    {
+        let saved = settings::load_board_geometry(&db.lock().unwrap().conn)
+            .ok()
+            .flatten();
+        BOARD_RESTORE.with(|pending| *pending.borrow_mut() = WindowGeometry::from_db(saved));
+        track_board_geometry(&board, &db);
+    }
     board.set_setting_dark(preferences.dark_theme);
     board.set_setting_shortcut(preferences.shortcut.clone().into());
     board.set_setting_startup(preferences.start_with_windows);
@@ -2132,7 +2297,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
             match result {
                 Ok(()) => {
-                    board.set_dark_theme(next.dark_theme);
+                    board.invoke_apply_theme(next.dark_theme);
                     *preferences.borrow_mut() = next;
                     board.set_settings_status("Saved. Shortcut changes apply next launch.".into());
                 }
@@ -2174,7 +2339,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     instance::Command::Background => (),
                     instance::Command::ShowBoard => {
                         refresh_due_reminders(&board, &db);
-                        let _ = board.show();
+                        let _ = show_board(&board);
                         board.window().with_winit_window(|host| host.focus_window());
                     }
                     instance::Command::Notification(uri) => {
@@ -2192,14 +2357,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     open_editor(&board, &db, &note_id, &windows);
                                 }
                                 refresh_due_reminders(&board, &db);
-                                let _ = board.show();
+                                let _ = show_board(&board);
                             }
                             Ok(None) => (), // Stale notification: never alter a newer occurrence.
                             Err(error) => {
                                 board.set_reminder_error(
                                     format!("Could not apply reminder action: {error}").into(),
                                 );
-                                let _ = board.show();
+                                let _ = show_board(&board);
                             }
                         }
                     }
@@ -2596,7 +2761,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match command {
                 tray::Command::ShowBoard => {
                     refresh_due_reminders(&board, &db);
-                    let _ = board.show();
+                    let _ = show_board(&board);
                 }
                 tray::Command::CreateNote => board.invoke_create_note(),
                 tray::Command::Quit => {
@@ -2613,7 +2778,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if failed {
                         // A normal Quit must not throw unsaved data away. The
                         // failed editor stays visible with its retryable error.
-                        let _ = board.show();
+                        let _ = show_board(&board);
                     } else {
                         std::process::exit(0);
                     }
@@ -2654,7 +2819,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
     if !background_launch || !has_tray {
-        board.show()?;
+        show_board(&board)?;
     }
     let restore_ids = floating_note_ids(&db.lock().unwrap().conn)?;
     for id in restore_ids {
@@ -3036,7 +3201,7 @@ fn open_editor(
     editor.on_open_board(move || {
         if let Some(board) = weak_board_button.upgrade() {
             refresh_due_reminders(&board, &db_open_board);
-            let _ = board.show();
+            let _ = show_board(&board);
         }
     });
     let weak_return = editor.as_weak();
@@ -3058,7 +3223,7 @@ fn open_editor(
                         board.set_board_view("notes".into());
                         board.set_query("".into());
                         refresh(&board, &db_return, "");
-                        let _ = board.show();
+                        let _ = show_board(&board);
                     }
                 }
             }

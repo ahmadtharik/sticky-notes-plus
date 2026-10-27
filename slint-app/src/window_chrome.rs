@@ -62,6 +62,20 @@ pub fn contains(bounds: (PhysicalPosition, slint::PhysicalSize), cursor: Physica
     x >= 0 && y >= 0 && x < i64::from(size.width) && y < i64::from(size.height)
 }
 
+/// A restored window must keep its title bar grabbable: the middle of its top
+/// edge has to lie on a connected monitor, or the saved position is dropped.
+pub fn title_on_monitor(
+    position: PhysicalPosition,
+    width: u32,
+    monitors: &[(PhysicalPosition, slint::PhysicalSize)],
+) -> bool {
+    let grab = PhysicalPosition::new(
+        position.x.saturating_add((width / 2) as i32),
+        position.y.saturating_add(16),
+    );
+    monitors.iter().any(|&monitor| contains(monitor, grab))
+}
+
 #[derive(Clone, Copy)]
 pub enum DropDestination {
     IntoBoard,
@@ -149,6 +163,41 @@ mod tests {
             inside,
             DropDestination::OutOfBoard
         ));
+    }
+    #[test]
+    fn restored_title_bar_must_land_on_a_connected_monitor() {
+        let monitors = [
+            (
+                PhysicalPosition::new(-2560, 0),
+                slint::PhysicalSize::new(2560, 1440),
+            ),
+            (
+                PhysicalPosition::new(0, 0),
+                slint::PhysicalSize::new(2560, 1440),
+            ),
+        ];
+        assert!(title_on_monitor(
+            PhysicalPosition::new(-1500, 100),
+            416,
+            &monitors
+        ));
+        assert!(title_on_monitor(
+            PhysicalPosition::new(2300, 100),
+            416,
+            &monitors
+        ));
+        // Saved on a monitor that is now unplugged, or dragged above the top.
+        assert!(!title_on_monitor(
+            PhysicalPosition::new(5200, 100),
+            416,
+            &monitors
+        ));
+        assert!(!title_on_monitor(
+            PhysicalPosition::new(100, -60),
+            416,
+            &monitors
+        ));
+        assert!(!title_on_monitor(PhysicalPosition::new(100, 100), 416, &[]));
     }
     #[test]
     fn drop_bounds_and_drag_threshold_use_physical_negative_desktop_coordinates() {

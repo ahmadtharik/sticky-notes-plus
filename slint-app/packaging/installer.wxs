@@ -13,8 +13,6 @@
           <Component Id="IdentityMarker" Guid="22B38337-482B-4A26-8DF0-FA640F42A26F">
             <File Id="NotificationIdentity" Source="$(var.IdentityFile)" />
             <RegistryValue Root="HKCU" Key="Software\StickyNotesPlus" Name="NotificationIdentity" Type="string" Value="StickyNotesPlus.Native" KeyPath="yes" />
-            <RegistryValue Root="HKCU" Key="Software\Classes\AppUserModelId\StickyNotesPlus.Native" Name="DisplayName" Type="string" Value="Sticky Notes+" />
-            <RegistryValue Root="HKCU" Key="Software\Classes\AppUserModelId\StickyNotesPlus.Native" Name="CustomActivator" Type="string" Value="{825593D6-1B38-4F1D-919D-3A04273E6AB0}" />
           </Component>
           <Component Id="Protocol" Guid="6D0DD517-F59F-4B9D-A0D3-77E09514C39A">
             <RegistryValue Root="HKCU" Key="Software\Classes\sticky-notes-plus" Type="string" Value="URL:Sticky Notes Plus Reminder" KeyPath="yes" />
@@ -28,9 +26,8 @@
       <Component Id="StartShortcut" Guid="194A4834-91A2-4CB0-A145-9409606FC42A">
         <Shortcut Id="StartMenuShortcut" Name="Sticky Notes+" Target="[#StickyExe]" WorkingDirectory="INSTALLFOLDER">
           <ShortcutProperty Key="System.AppUserModel.ID" Value="StickyNotesPlus.Native" />
-          <!-- Protocol-only activation: stub CLSID enables Action Center persistence;
-               deliberately no COM server is registered for this GUID. -->
-          <ShortcutProperty Key="System.AppUserModel.ToastActivatorCLSID" Value="{825593D6-1B38-4F1D-919D-3A04273E6AB0}" />
+          <!-- Reminder buttons use the app-owned URL protocol. Do not advertise a
+               ToastActivatorCLSID without a real COM server registration. -->
         </Shortcut>
         <RegistryValue Root="HKCU" Key="Software\StickyNotesPlus" Name="ShortcutInstalled" Type="integer" Value="1" KeyPath="yes" />
       </Component>
