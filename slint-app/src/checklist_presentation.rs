@@ -51,6 +51,19 @@ pub fn target(source: &str, offset: usize) -> Option<(i32, bool)> {
     None
 }
 
+/// Source byte offset and checked state of every task marker.
+pub fn markers(source: &str) -> Vec<(usize, bool)> {
+    let mut start = 0;
+    let mut found = Vec::new();
+    for line in source.split('\n') {
+        if let Some((checked, _)) = crate::checklist_marker(line) {
+            found.push((start + line.len() - line.trim_start().len(), checked));
+        }
+        start += line.len() + 1;
+    }
+    found
+}
+
 /// Source byte ranges of completed task bodies, excluding indentation/markers.
 pub fn completed_bodies(source: &str) -> Vec<(usize, usize)> {
     let mut start = 0;

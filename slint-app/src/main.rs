@@ -2359,13 +2359,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let weak = board.as_weak();
         let db = db.clone();
         let preferences = preferences.clone();
-        board.on_apply_settings(move || {
+        board.on_apply_settings(move |include_shortcut| {
             let Some(board) = weak.upgrade() else {
                 return;
             };
+            // Toggles save on their own; an unsaved shortcut edit waits for Save.
+            let shortcut = if include_shortcut {
+                board.get_setting_shortcut().trim().into()
+            } else {
+                preferences.borrow().shortcut.clone()
+            };
             let next = settings::Preferences {
                 dark_theme: board.get_setting_dark(),
-                shortcut: board.get_setting_shortcut().trim().into(),
+                shortcut,
                 start_with_windows: board.get_setting_startup(),
                 ..settings::Preferences::default()
             };
@@ -2379,10 +2385,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Ok(()) => {
                     board.invoke_apply_theme(next.dark_theme);
                     *preferences.borrow_mut() = next;
-                    board.set_settings_status("Saved. Shortcut changes apply next launch.".into());
+                    board.set_settings_status(if include_shortcut {
+                        "Shortcut saved. It applies next launch.".into()
+                    } else {
+                        "".into()
+                    });
                 }
                 Err(error) => {
-                    board.set_settings_status(format!("Settings not applied: {error}").into())
+                    // Put the toggles back to what is actually saved.
+                    let saved = preferences.borrow();
+                    board.set_setting_dark(saved.dark_theme);
+                    board.set_setting_startup(saved.start_with_windows);
+                    board.set_settings_status(format!("Settings not saved: {error}").into())
                 }
             }
         });

@@ -57,6 +57,14 @@ pub struct NativeDocument {
 }
 
 #[repr(C)]
+/// Presentation-only formatting laid over checklist lines; removed before the
+/// document is read back so it never reaches saved styles.
+#[derive(Clone, Copy)]
+enum TaskStyle {
+    Body { struck: bool },
+    Marker,
+}
+
 #[derive(Clone, Copy)]
 struct CharRange {
     cp_min: i32,
@@ -128,7 +136,7 @@ struct Inner {
     palette: Cell<Option<u32>>,
     text_document: Option<ITextDocument>,
     tracked_chips: RefCell<Vec<TrackedNativeChip>>,
-    task_styles: RefCell<Vec<(ITextRange, bool)>>,
+    task_styles: RefCell<Vec<(ITextRange, TaskStyle)>>,
     last_edit_at: Cell<Option<usize>>,
     image_loader: RefCell<Option<Box<dyn Fn(&str) -> Result<Vec<u8>, String>>>>,
     images: RefCell<HashMap<String, Vec<u8>>>,
@@ -823,6 +831,14 @@ unsafe extern "system" fn rich_edit_proc(
         return 0;
     };
     let original = unsafe { (*pointer).original_proc.get() };
+    if message == windows_sys::Win32::UI::WindowsAndMessaging::WM_SETCURSOR
+        && (lparam as u32 & 0xffff) == 1
+        && pointer_over_checkbox(hwnd)
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{LoadCursorW, SetCursor, IDC_HAND};
+        SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
+        return 1;
+    }
     if message == windows_sys::Win32::UI::WindowsAndMessaging::WM_LBUTTONDOWN {
         (*pointer).mouse_down.set(Some((
             (lparam as u32 & 0xffff) as i16,
@@ -1444,6 +1460,45 @@ unsafe fn apply_palette(hwnd: HWND, rgb: u32) {
     let _ = document_from_control(hwnd);
 }
 
+/// True when the mouse is over a checklist square, so it shows a hand cursor.
+unsafe fn pointer_over_checkbox(hwnd: HWND) -> bool {
+    use windows_sys::Win32::{Foundation::POINT, Graphics::Gdi::ScreenToClient};
+    const EM_CHARFROMPOS: u32 = 0x00D7;
+    let mut point = POINT { x: 0, y: 0 };
+    if windows_sys::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut point) == 0
+        || ScreenToClient(hwnd, &mut point) == 0
+    {
+        return false;
+    }
+    let index = SendMessageW(hwnd, EM_CHARFROMPOS, 0, (&point as *const POINT) as LPARAM);
+    if index < 0 {
+        return false;
+    }
+    // The nearest character can be the marker even well left of or below it;
+    // require the pointer to be over the marker's own box.
+    let mut origin = POINT { x: 0, y: 0 };
+    const EM_POSFROMCHAR: u32 = 0x00D6;
+    SendMessageW(
+        hwnd,
+        EM_POSFROMCHAR,
+        (&mut origin as *mut POINT) as WPARAM,
+        index,
+    );
+    let mut after = POINT { x: 0, y: 0 };
+    SendMessageW(
+        hwnd,
+        EM_POSFROMCHAR,
+        (&mut after as *mut POINT) as WPARAM,
+        index + 1,
+    );
+    if point.x < origin.x || (after.y == origin.y && point.x > after.x) {
+        return false;
+    }
+    let projection = control_projection(hwnd);
+    crate::checklist_presentation::target(&projection.source, projection.to_source(index as usize))
+        .is_some()
+}
+
 unsafe fn control_projection(hwnd: HWND) -> crate::native_projection::Projection {
     let length = SendMessageW(hwnd, WM_GETTEXTLENGTH, 0, 0).max(0) as usize;
     let mut buffer = vec![0u16; length + 1];
@@ -1595,7 +1650,7 @@ unsafe fn clear_task_styles(hwnd: HWND) {
     let previous = selection(hwnd);
     let suppress = inner.suppress_change.replace(true);
     let _redraw = RedrawBatch::new(hwnd);
-    for (range, struck) in ranges {
+    for (range, style) in ranges {
         let (Ok(start), Ok(end)) = (range.GetStart(), range.GetEnd()) else {
             continue;
         };
@@ -1608,7 +1663,12 @@ unsafe fn clear_task_styles(hwnd: HWND) {
         );
         let mut format = char_format();
         format.dw_mask = CFM_STRIKEOUT | 0x4000_0000;
-        format.dw_effects = if struck { CFM_STRIKEOUT } else { 0 };
+        match style {
+            TaskStyle::Body { struck } => {
+                format.dw_effects = if struck { CFM_STRIKEOUT } else { 0 };
+            }
+            TaskStyle::Marker => set_face(&mut format, "Segoe UI", 210),
+        }
         format.cr_text_color = if matches!(inner.palette.get(), Some(0x454545 | 0x6f7078)) {
             0x00f6f5f5
         } else {
@@ -1637,7 +1697,8 @@ unsafe fn style_completed_tasks(
         return;
     };
     let bodies = crate::checklist_presentation::completed_bodies(&document.text);
-    if bodies.is_empty() {
+    let markers = crate::checklist_presentation::markers(&document.text);
+    if markers.is_empty() {
         return;
     }
     // Existing overlays must be removed by the caller before capturing styles.
@@ -1662,7 +1723,10 @@ unsafe fn style_completed_tasks(
                 .strike
                 .iter()
                 .any(|&(s, e)| s <= bounds[0] && e >= bounds[1]);
-            inner.task_styles.borrow_mut().push((range, struck));
+            inner
+                .task_styles
+                .borrow_mut()
+                .push((range, TaskStyle::Body { struck }));
             set_selection(
                 hwnd,
                 CharRange {
@@ -1686,10 +1750,54 @@ unsafe fn style_completed_tasks(
             );
         }
     }
+    // Larger, coloured squares read as clickable controls.
+    let dark = matches!(inner.palette.get(), Some(0x454545 | 0x6f7078));
+    for (offset, checked) in markers {
+        let a = projection.to_control(offset) as i32;
+        let Ok(range) = tom.Range(a, a + 1) else {
+            continue;
+        };
+        inner
+            .task_styles
+            .borrow_mut()
+            .push((range, TaskStyle::Marker));
+        set_selection(
+            hwnd,
+            CharRange {
+                cp_min: a,
+                cp_max: a + 1,
+            },
+        );
+        let mut format = char_format();
+        format.dw_mask = CFM_STRIKEOUT | 0x4000_0000;
+        set_face(&mut format, "Segoe UI Symbol", 270);
+        // COLORREF is 0x00BBGGRR.
+        format.cr_text_color = match (checked, dark) {
+            (true, false) => 0x00c06700,
+            (true, true) => 0x00ffc560,
+            (false, false) => 0x00505050,
+            (false, true) => 0x00d0d0d0,
+        };
+        SendMessageW(
+            hwnd,
+            EM_SETCHARFORMAT,
+            SCF_SELECTION,
+            (&format as *const CharFormat2W) as LPARAM,
+        );
+    }
     // Date labels retain their own foreground/background within a task.
     style_chips(hwnd, projection);
     set_selection(hwnd, previous);
     inner.suppress_change.set(suppress);
+}
+
+fn set_face(format: &mut CharFormat2W, face: &str, height: i32) {
+    format.dw_mask |= 0x2000_0000 | 0x8000_0000;
+    format.y_height = height;
+    format.sz_face_name = [0; 32];
+    for (index, unit) in face.encode_utf16().enumerate() {
+        format.sz_face_name[index] = unit;
+    }
 }
 
 unsafe fn style_chips(hwnd: HWND, projection: &crate::native_projection::Projection) {

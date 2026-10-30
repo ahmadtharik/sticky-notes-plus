@@ -1,4 +1,4 @@
-import { Button, CheckBox, ComboBox, LineEdit, ScrollView, Palette } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, ScrollView, Switch, Palette } from "std-widgets.slint";
 
 export struct NoteCard {
     id: string,
@@ -188,6 +188,21 @@ component NoteAction inherits Rectangle {
     }
 }
 
+// A titled card on the Settings page.
+component SettingsSection inherits Rectangle {
+    in property <string> title;
+    in property <color> foreground;
+    in property <bool> dark;
+    background: root.dark ? #2a2d34 : #f4f5f7;
+    border-radius: 8px;
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+        Text { text: root.title; color: root.foreground; font-size: 13px; font-weight: 600; }
+        @children
+    }
+}
+
 component ColorSwatch inherits Rectangle {
     in property <color> swatch-color;
     in property <string> label;
@@ -263,7 +278,8 @@ export component BoardWindow inherits Window {
     property <color> board-foreground: root.dark-theme ? #f1f2f5 : #25262c;
     property <color> board-muted: root.dark-theme ? #b8bdc9 : #6b7080;
     property <color> board-error: root.dark-theme ? #ff8a80 : #ab2e26;
-    callback apply-settings();
+    // Saves preferences; the shortcut field only when include-shortcut is set.
+    callback apply-settings(/* include-shortcut */ bool);
     // Google Calendar: one-way push of timed reminders.
     in-out property <bool> calendar-configured: false;
     in-out property <bool> calendar-connected: false;
@@ -335,90 +351,24 @@ export component BoardWindow inherits Window {
     }
     VerticalLayout {
         padding: 16px;
+        // The list's scrollbar sits in the right margin, not over the cards.
+        padding-right: 4px;
         spacing: 12px;
+        VerticalLayout {
+        padding-right: 12px;
+        spacing: 12px;
+        vertical-stretch: 0;
         HorizontalLayout {
             spacing: 12px;
             NoteAction { text: "+"; label: "New note"; foreground: root.board-foreground; width: 32px; height: 36px; clicked => { root.create-note(); } }
-            Text { text: root.note-drop-active ? "Drop note here" : root.card-drag-active ? "Release outside to open" : root.board-view == "archive" ? "Archive" : root.board-view == "deleted" ? "Deleted notes" : "Sticky Notes"; font-size: root.note-drop-active || root.card-drag-active ? 16px : 24px; font-weight: 600; color: root.board-foreground; vertical-alignment: center; }
+            Text { text: root.settings-open ? "Settings" : root.note-drop-active ? "Drop note here" : root.card-drag-active ? "Release outside to open" : root.board-view == "archive" ? "Archive" : root.board-view == "deleted" ? "Deleted notes" : "Sticky Notes"; font-size: root.note-drop-active || root.card-drag-active ? 16px : 24px; font-weight: 600; color: root.board-foreground; vertical-alignment: center; }
             Rectangle { horizontal-stretch: 1; }
-            NoteAction { has-icon: true; icon: @image-url("icons/settings.svg"); label: "Settings and additional views"; foreground: root.board-foreground; width: 36px; height: 36px; clicked => { if (root.settings-open) { root.settings-open = false; root.navigation-open = false; } else { root.navigation-open = !root.navigation-open; } } }
+            if root.settings-open: Button { text: "Done"; primary: true; clicked => { root.settings-open = false; root.navigation-open = false; root.settings-status = ""; } }
+            if !root.settings-open: NoteAction { has-icon: true; icon: @image-url("icons/settings.svg"); label: "Settings and additional views"; foreground: root.board-foreground; width: 36px; height: 36px; clicked => { if (root.settings-open) { root.settings-open = false; root.navigation-open = false; } else { root.navigation-open = !root.navigation-open; } } }
         }
-        HorizontalLayout {
+        if !root.settings-open: HorizontalLayout {
             spacing: 8px;
             LineEdit { placeholder-text: "Search…"; text <=> query; edited => { root.search(self.text); } horizontal-stretch: 1; min-width: 0px; }
-        }
-        // Natural height only: extra space belongs to the card list.
-        if root.settings-open: VerticalLayout {
-            spacing: 6px;
-            vertical-stretch: 0;
-            HorizontalLayout {
-                CheckBox { text: "Dark appearance"; checked <=> root.setting-dark; }
-                CheckBox { text: "Start with Windows"; checked <=> root.setting-startup; }
-            }
-            HorizontalLayout {
-                Text { text: "New-note shortcut"; color: root.board-foreground; vertical-alignment: center; }
-                LineEdit { text <=> root.setting-shortcut; placeholder-text: "Ctrl+Alt+N"; horizontal-stretch: 1; min-width: 0px; }
-                Button { text: "Apply"; clicked => { root.apply-settings(); } }
-            }
-            Text { text: root.settings-status == "" ? "Startup is opt-in. Shortcut changes apply next launch." : root.settings-status; color: root.board-muted; wrap: word-wrap; }
-            HorizontalLayout {
-                Button { text: "Import Tauri notes…"; clicked => { root.preview-import(); } }
-                Button { visible: root.import-pending; text: "Confirm import"; clicked => { root.confirm-import(); } }
-                Button { visible: root.import-pending; text: "Cancel"; clicked => { root.cancel-import(); } }
-            }
-            Text { visible: root.import-status != ""; text: root.import-status; color: root.board-muted; wrap: word-wrap; }
-            Rectangle { height: 1px; background: root.board-muted; opacity: 0.4; }
-            Text { text: "Google Calendar"; color: root.board-foreground; font-weight: 600; }
-            Text { text: root.calendar-status; color: root.board-muted; wrap: word-wrap; }
-            if root.calendar-configured && !root.calendar-connected && !root.calendar-setup-open: HorizontalLayout {
-                alignment: start;
-                Button { text: "Connect Google Calendar…"; clicked => { root.calendar-setup-open = true; } }
-            }
-            // First connect: choices, then the browser sign-in.
-            if root.calendar-setup-open: VerticalLayout {
-                spacing: 6px;
-                Text { text: "Reminders with a time become events in a new \"Sticky Notes\" calendar, so your phone can alert you."; color: root.board-foreground; wrap: word-wrap; }
-                CheckBox { text: "Add events for my existing timed reminders"; checked <=> root.calendar-sync-existing; }
-                HorizontalLayout {
-                    spacing: 8px;
-                    Text { text: "Alert"; color: root.board-foreground; vertical-alignment: center; }
-                    ComboBox { model: ["At the reminder time", "10 minutes before", "20 minutes before", "30 minutes before", "1 hour before"]; current-index <=> root.calendar-alert-index; horizontal-stretch: 1; }
-                }
-                CheckBox { text: "Include note text (off sends only the title)"; checked <=> root.calendar-include-text; }
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: end;
-                    Button { text: "Cancel"; clicked => { root.calendar-setup-open = false; } }
-                    Button { text: "Continue in browser"; primary: true; clicked => { root.calendar-setup-open = false; root.calendar-connect(); } }
-                }
-            }
-            if root.calendar-connected && !root.calendar-confirm-disconnect: VerticalLayout {
-                spacing: 6px;
-                HorizontalLayout {
-                    spacing: 8px;
-                    Text { text: "Alert"; color: root.board-foreground; vertical-alignment: center; }
-                    ComboBox { model: ["At the reminder time", "10 minutes before", "20 minutes before", "30 minutes before", "1 hour before"]; current-index <=> root.calendar-alert-index; selected => { root.calendar-save-options(); } horizontal-stretch: 1; }
-                }
-                CheckBox { text: "Include note text (off sends only the title)"; checked <=> root.calendar-include-text; toggled => { root.calendar-save-options(); } }
-                Text { text: "Sync is one-way: changes made in Google are replaced when the note changes."; color: root.board-muted; wrap: word-wrap; font-size: 12px; }
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: start;
-                    Button { text: "Sync now"; clicked => { root.calendar-sync-now(); } }
-                    Button { text: "Disconnect…"; clicked => { root.calendar-delete-calendar = false; root.calendar-confirm-disconnect = true; } }
-                }
-            }
-            if root.calendar-connected && root.calendar-confirm-disconnect: VerticalLayout {
-                spacing: 6px;
-                Text { text: "Disconnect Google Calendar? Reminders keep working on this PC."; color: root.board-foreground; wrap: word-wrap; }
-                CheckBox { text: "Also delete the Sticky Notes calendar from Google"; checked <=> root.calendar-delete-calendar; }
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: end;
-                    Button { text: "Cancel"; clicked => { root.calendar-confirm-disconnect = false; } }
-                    Button { text: "Disconnect"; clicked => { root.calendar-confirm-disconnect = false; root.calendar-disconnect(); } }
-                }
-            }
         }
         if root.navigation-open: VerticalLayout {
             spacing: 0px;
@@ -426,14 +376,14 @@ export component BoardWindow inherits Window {
             NoteAction { text: "Archive"; menu-row: true; foreground: root.board-foreground; emphasis: root.board-view == "archive"; height: 32px; clicked => { root.card-menu-id = ""; root.navigation-open = false; root.select-board-view("archive"); } }
             NoteAction { text: "Deleted"; menu-row: true; foreground: root.board-foreground; emphasis: root.board-view == "deleted"; height: 32px; clicked => { root.card-menu-id = ""; root.navigation-open = false; root.select-board-view("deleted"); } }
             NoteAction { text: "Reminders"; menu-row: true; foreground: root.board-foreground; height: 32px; clicked => { root.reminder-panel-open = !root.reminder-panel-open; root.navigation-open = false; } }
-            NoteAction { text: "Settings"; menu-row: true; foreground: root.board-foreground; height: 32px; clicked => { root.settings-open = !root.settings-open; root.setting-dark = root.dark-theme; root.navigation-open = false; } }
+            NoteAction { text: "Settings"; menu-row: true; foreground: root.board-foreground; height: 32px; clicked => { root.settings-open = true; root.setting-dark = root.dark-theme; root.settings-status = ""; root.reminder-panel-open = false; root.navigation-open = false; } }
         }
         if root.reminder-error != "": HorizontalLayout {
             Text { text: root.reminder-error; color: root.board-error; wrap: word-wrap; horizontal-stretch: 1; }
             Button { text: "Dismiss"; clicked => { root.reminder-error = ""; } }
         }
-        if root.reminder-panel-open && due-reminders.length > 0: Rectangle {
-            height: root.settings-open ? 150px : min(240px, root.height * 0.38);
+        if root.reminder-panel-open && !root.settings-open && due-reminders.length > 0: Rectangle {
+            height: min(240px, root.height * 0.38);
             background: root.dark-theme ? #3a3322 : #fff7d6;
             border-width: 1px;
             border-color: root.dark-theme ? #8a7434 : #d8bc63;
@@ -519,10 +469,121 @@ export component BoardWindow inherits Window {
             Text { text: root.window-status; color: root.board-error; wrap: word-wrap; horizontal-stretch: 1; }
             Button { text: "Dismiss"; clicked => { root.window-status = ""; } }
         }
-        if notes.length == 0: Text { text: root.board-view == "notes" ? "No notes yet. Create one to keep a thought close at hand." : root.board-view == "archive" ? "Your archive is empty. Archived notes can always return to Notes." : "Nothing is in Deleted notes. Deleted notes can be restored here."; color: root.board-muted; horizontal-alignment: center; wrap: word-wrap; }
-        ScrollView {
+        if notes.length == 0 && !root.settings-open: Text { text: root.board-view == "notes" ? "No notes yet. Create one to keep a thought close at hand." : root.board-view == "archive" ? "Your archive is empty. Archived notes can always return to Notes." : "Nothing is in Deleted notes. Deleted notes can be restored here."; color: root.board-muted; horizontal-alignment: center; wrap: word-wrap; }
+        }
+        // Settings replaces the card list; each section is a card.
+        if root.settings-open: ScrollView {
             viewport-width: self.visible-width;
             VerticalLayout {
+                padding-right: 12px;
+                spacing: 12px;
+                alignment: start;
+                SettingsSection {
+                    title: "Appearance";
+                    foreground: root.board-foreground;
+                    dark: root.dark-theme;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: "Dark mode"; color: root.board-foreground; vertical-alignment: center; horizontal-stretch: 1; }
+                        Switch { checked <=> root.setting-dark; toggled => { root.apply-settings(false); } }
+                    }
+                }
+                SettingsSection {
+                    title: "Startup";
+                    foreground: root.board-foreground;
+                    dark: root.dark-theme;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: "Start with Windows"; color: root.board-foreground; vertical-alignment: center; horizontal-stretch: 1; }
+                        Switch { checked <=> root.setting-startup; toggled => { root.apply-settings(false); } }
+                    }
+                }
+                SettingsSection {
+                    title: "Keyboard shortcut";
+                    foreground: root.board-foreground;
+                    dark: root.dark-theme;
+                    Text { text: "Create a new note from anywhere. Takes effect next launch."; color: root.board-muted; wrap: word-wrap; font-size: 12px; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        LineEdit { text <=> root.setting-shortcut; placeholder-text: "Ctrl+Alt+N"; horizontal-stretch: 1; min-width: 0px; accepted => { root.apply-settings(true); } }
+                        Button { text: "Save"; clicked => { root.apply-settings(true); } }
+                    }
+                }
+                if root.settings-status != "": Text { text: root.settings-status; color: root.board-muted; wrap: word-wrap; }
+                SettingsSection {
+                    title: "Google Calendar";
+                    foreground: root.board-foreground;
+                    dark: root.dark-theme;
+                Text { text: root.calendar-status; color: root.board-muted; wrap: word-wrap; }
+                if root.calendar-configured && !root.calendar-connected && !root.calendar-setup-open: HorizontalLayout {
+                    alignment: start;
+                    Button { text: "Connect Google Calendar…"; clicked => { root.calendar-setup-open = true; } }
+                }
+                // First connect: choices, then the browser sign-in.
+                if root.calendar-setup-open: VerticalLayout {
+                    spacing: 6px;
+                    Text { text: "Reminders with a time become events in a new \"Sticky Notes\" calendar, so your phone can alert you."; color: root.board-foreground; wrap: word-wrap; }
+                    CheckBox { text: "Add events for my existing timed reminders"; checked <=> root.calendar-sync-existing; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: "Alert"; color: root.board-foreground; vertical-alignment: center; }
+                        ComboBox { model: ["At the reminder time", "10 minutes before", "20 minutes before", "30 minutes before", "1 hour before"]; current-index <=> root.calendar-alert-index; horizontal-stretch: 1; }
+                    }
+                    CheckBox { text: "Include note text (off sends only the title)"; checked <=> root.calendar-include-text; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: end;
+                        Button { text: "Cancel"; clicked => { root.calendar-setup-open = false; } }
+                        Button { text: "Continue in browser"; primary: true; clicked => { root.calendar-setup-open = false; root.calendar-connect(); } }
+                    }
+                }
+                if root.calendar-connected && !root.calendar-confirm-disconnect: VerticalLayout {
+                    spacing: 6px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: "Alert"; color: root.board-foreground; vertical-alignment: center; }
+                        ComboBox { model: ["At the reminder time", "10 minutes before", "20 minutes before", "30 minutes before", "1 hour before"]; current-index <=> root.calendar-alert-index; selected => { root.calendar-save-options(); } horizontal-stretch: 1; }
+                    }
+                    CheckBox { text: "Include note text (off sends only the title)"; checked <=> root.calendar-include-text; toggled => { root.calendar-save-options(); } }
+                    Text { text: "Sync is one-way: changes made in Google are replaced when the note changes."; color: root.board-muted; wrap: word-wrap; font-size: 12px; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        Button { text: "Sync now"; clicked => { root.calendar-sync-now(); } }
+                        Button { text: "Disconnect…"; clicked => { root.calendar-delete-calendar = false; root.calendar-confirm-disconnect = true; } }
+                    }
+                }
+                if root.calendar-connected && root.calendar-confirm-disconnect: VerticalLayout {
+                    spacing: 6px;
+                    Text { text: "Disconnect Google Calendar? Reminders keep working on this PC."; color: root.board-foreground; wrap: word-wrap; }
+                    CheckBox { text: "Also delete the Sticky Notes calendar from Google"; checked <=> root.calendar-delete-calendar; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: end;
+                        Button { text: "Cancel"; clicked => { root.calendar-confirm-disconnect = false; } }
+                        Button { text: "Disconnect"; clicked => { root.calendar-confirm-disconnect = false; root.calendar-disconnect(); } }
+                    }
+                }
+                }
+                SettingsSection {
+                    title: "Data";
+                    foreground: root.board-foreground;
+                    dark: root.dark-theme;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        Button { text: "Import Tauri notes…"; clicked => { root.preview-import(); } }
+                        Button { visible: root.import-pending; text: "Confirm import"; clicked => { root.confirm-import(); } }
+                        Button { visible: root.import-pending; text: "Cancel"; clicked => { root.cancel-import(); } }
+                    }
+                    if root.import-status != "": Text { text: root.import-status; color: root.board-muted; wrap: word-wrap; }
+                }
+            }
+        }
+        if !root.settings-open: ScrollView {
+            viewport-width: self.visible-width;
+            VerticalLayout {
+                padding-right: 12px;
                 spacing: 10px;
             for card in notes: Rectangle {
                 property <bool> dragging: root.card-drag-active && root.pressed-card-id == card.id;
@@ -893,16 +954,18 @@ export component NoteWindow inherits Window {
             height: root.save-error ? 62px : 40px;
             background: #ffffff12;
             border-radius: 0px;
-            Rectangle { height: 1px; width: parent.width; background: #00000018; }
+            // Divider along the top edge; without y Slint centres it over the icons.
+            Rectangle { y: 0px; height: 1px; width: parent.width; background: #00000018; }
             VerticalLayout {
                 spacing: 0px;
             HorizontalLayout {
                 height: 40px;
+                padding-left: 4px;
                 spacing: 0px;
                 bold-action := NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "B"; label: "Bold"; emphasis: true; width: 32px; clicked => { root.toggle-selection-style("bold", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
                 NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "I"; italic: true; label: "Italic"; width: 32px; clicked => { root.toggle-selection-style("italic", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
-                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "U̲"; label: "Underline"; width: 32px; clicked => { root.toggle-selection-style("underline", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
-                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "a̶b̶"; label: "Strikethrough"; width: 32px; clicked => { root.toggle-selection-style("strike", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/underline.svg"); label: "Underline"; width: 32px; clicked => { root.toggle-selection-style("underline", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/strikethrough.svg"); label: "Strikethrough"; width: 32px; clicked => { root.toggle-selection-style("strike", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
                 NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/list.svg"); label: "Bullet list"; width: 32px; clicked => { editor-input.apply-list("bullet"); } }
                 NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/image.svg"); label: "Add image"; width: 32px; clicked => { root.add-image(); } }
                 NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/checklist.svg"); label: "Checklist"; width: 32px; clicked => { editor-input.apply-list("checklist"); } }
@@ -997,7 +1060,7 @@ export component NoteWindow inherits Window {
             width: min(290px, parent.width - 16px);
             // Keep the toolbar/date toggle reachable while this surface is
             // open. Very small notes scroll the picker instead of covering it.
-            height: min(350px, max(60px, parent.height - 90px));
+            height: min(326px, max(60px, parent.height - 60px));
         Rectangle {
             width: parent.width; height: parent.height;
             background: #ffffff;
@@ -1010,45 +1073,49 @@ export component NoteWindow inherits Window {
             ScrollView {
                 width: parent.width; height: parent.height;
                 viewport-width: self.visible-width;
+            // Compact layout: month, days, time + repeat, action. Fits the
+            // default note without scrolling; the calendar is the date input.
             VerticalLayout {
-                padding: 8px;
-                spacing: 4px;
+                padding: 10px;
+                spacing: 6px;
                 HorizontalLayout {
-                    Text { text: root.calendar-caption; font-size: 14px; vertical-alignment: center; horizontal-stretch: 1; }
+                    spacing: 2px;
+                    NoteAction { text: "‹"; label: "Previous month"; width: 28px; height: 28px; clicked => { root.move-calendar-month(-1); } }
+                    Text { text: root.calendar-caption; font-size: 14px; font-weight: 600; color: #25262c; horizontal-alignment: center; vertical-alignment: center; horizontal-stretch: 1; }
+                    NoteAction { text: "›"; label: "Next month"; width: 28px; height: 28px; clicked => { root.move-calendar-month(1); } }
                     NoteAction { text: "×"; label: "Close date picker"; width: 28px; height: 28px; clicked => { root.dismiss-date-panel(); } }
                 }
-                HorizontalLayout {
-                    spacing: 4px;
-                    NoteAction { text: "‹"; label: "Previous month"; width: 30px; height: 28px; clicked => { root.move-calendar-month(-1); } }
-                    Rectangle { horizontal-stretch: 1; }
-                    NoteAction { text: "›"; label: "Next month"; width: 30px; height: 28px; clicked => { root.move-calendar-month(1); } }
-                }
-                HorizontalLayout {
-                    for label in ["M", "T", "W", "T", "F", "S", "S"]: Text { text: label; horizontal-stretch: 1; horizontal-alignment: center; color: #777777; font-size: 10px; }
-                }
-                for week in root.calendar-weeks: HorizontalLayout {
-                    spacing: 2px;
-                    for day in week.days: Rectangle {
-                        min-width: 0px; preferred-width: 34px; horizontal-stretch: 1; height: 27px;
-                        Rectangle { x: (parent.width - self.width) / 2; width: 27px; height: 27px; border-radius: 13.5px; background: day.selected ? #ffe66a : transparent; }
-                        NoteAction { text: day.label; label: day.date; foreground: day.in-month ? #323232 : #aaaaaa; width: parent.width; height: parent.height; text-size: 12px; clicked => { root.pick-calendar-day(day.date); } }
+                VerticalLayout {
+                    spacing: 0px;
+                    HorizontalLayout {
+                        for label in ["M", "T", "W", "T", "F", "S", "S"]: Text { text: label; horizontal-stretch: 1; horizontal-alignment: center; color: #6b7080; font-size: 10px; }
+                    }
+                    for week in root.calendar-weeks: HorizontalLayout {
+                        for day in week.days: Rectangle {
+                            min-width: 0px; preferred-width: 34px; horizontal-stretch: 1; height: 26px;
+                            Rectangle { x: (parent.width - self.width) / 2; width: 24px; height: 24px; border-radius: 12px; background: day.selected ? #ffe66a : transparent; }
+                            NoteAction { text: day.label; label: day.date; foreground: day.in-month ? #323232 : #aaaaaa; width: parent.width; height: parent.height; text-size: 12px; clicked => { root.pick-calendar-day(day.date); } }
+                        }
                     }
                 }
                 HorizontalLayout {
-                    LineEdit { text <=> root.date-input; placeholder-text: "YYYY-MM-DD"; accessible-label: "Date"; min-width: 0px; horizontal-stretch: 1; }
-                    LineEdit { text <=> root.date-time-input; placeholder-text: "HH:mm"; accessible-label: "Time (optional)"; width: 80px; }
-                }
-                HorizontalLayout {
-                    spacing: 3px;
-                    Button { text: "Once"; primary: root.date-repeat == "none"; clicked => { root.date-repeat = "none"; } }
-                    Button { text: "Daily"; primary: root.date-repeat == "daily"; clicked => { root.date-repeat = "daily"; } }
-                    Button { text: "Weekly"; primary: root.date-repeat == "weekly"; clicked => { root.date-repeat = "weekly"; } }
-                    Button { text: "Monthly"; primary: root.date-repeat == "monthly"; clicked => { root.date-repeat = "monthly"; } }
+                    spacing: 6px;
+                    LineEdit { text <=> root.date-time-input; placeholder-text: "Time (14:30)"; accessible-label: "Time (optional)"; width: 104px; }
+                    ComboBox {
+                        model: ["Doesn't repeat", "Daily", "Weekly", "Monthly"];
+                        accessible-label: "Repeat";
+                        current-index: root.date-repeat == "daily" ? 1 : root.date-repeat == "weekly" ? 2 : root.date-repeat == "monthly" ? 3 : 0;
+                        selected => { root.date-repeat = self.current-index == 1 ? "daily" : self.current-index == 2 ? "weekly" : self.current-index == 3 ? "monthly" : "none"; }
+                        horizontal-stretch: 1;
+                        min-width: 0px;
+                    }
                 }
                 Text { visible: root.date-error != ""; text: root.date-error; color: #ab2e26; wrap: word-wrap; font-size: 10px; }
                 HorizontalLayout {
-                    Button { text: selected-date-occurrence >= 0 ? "Update" : "Insert date"; horizontal-stretch: 1; clicked => { root.apply-date-selection(); } }
+                    spacing: 6px;
+                    alignment: end;
                     Button { visible: selected-date-occurrence >= 0; text: "Remove"; clicked => { root.remove-selected-date(); } }
+                    Button { text: selected-date-occurrence >= 0 ? "Update" : "Add date"; primary: true; clicked => { root.apply-date-selection(); } }
                 }
             }
             }
