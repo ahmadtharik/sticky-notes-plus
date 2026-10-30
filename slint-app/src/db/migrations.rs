@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-pub const CURRENT: i64 = 5;
+pub const CURRENT: i64 = 6;
 
 const INITIAL: &str = include_str!("../../schema/001_initial.sql");
 
@@ -104,6 +104,15 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<i64> {
             height INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS attachments_note_idx ON attachments(note_id);",
+    )?;
+    // No foreign key: the reminder row may already be gone when its Google
+    // event still has to be deleted.
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS calendar_events (
+            reminder_id TEXT PRIMARY KEY,
+            event_id TEXT NOT NULL,
+            fingerprint TEXT NOT NULL
+         );",
     )?;
     tx.execute(
         "INSERT INTO meta(key,value) VALUES ('schema_version',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",

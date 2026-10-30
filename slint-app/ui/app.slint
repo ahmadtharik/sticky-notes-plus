@@ -1,4 +1,4 @@
-import { Button, CheckBox, LineEdit, ScrollView, Palette } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, ScrollView, Palette } from "std-widgets.slint";
 
 export struct NoteCard {
     id: string,
@@ -264,6 +264,20 @@ export component BoardWindow inherits Window {
     property <color> board-muted: root.dark-theme ? #b8bdc9 : #6b7080;
     property <color> board-error: root.dark-theme ? #ff8a80 : #ab2e26;
     callback apply-settings();
+    // Google Calendar: one-way push of timed reminders.
+    in-out property <bool> calendar-configured: false;
+    in-out property <bool> calendar-connected: false;
+    in-out property <string> calendar-status: "Not connected.";
+    in-out property <bool> calendar-setup-open: false;
+    in-out property <bool> calendar-sync-existing: true;
+    in-out property <int> calendar-alert-index: 1;
+    in-out property <bool> calendar-include-text: true;
+    in-out property <bool> calendar-confirm-disconnect: false;
+    in-out property <bool> calendar-delete-calendar: false;
+    callback calendar-connect();
+    callback calendar-save-options();
+    callback calendar-sync-now();
+    callback calendar-disconnect();
     in-out property <bool> import-pending: false;
     in-out property <string> import-status;
     callback preview-import();
@@ -333,8 +347,10 @@ export component BoardWindow inherits Window {
             spacing: 8px;
             LineEdit { placeholder-text: "Search…"; text <=> query; edited => { root.search(self.text); } horizontal-stretch: 1; min-width: 0px; }
         }
+        // Natural height only: extra space belongs to the card list.
         if root.settings-open: VerticalLayout {
             spacing: 6px;
+            vertical-stretch: 0;
             HorizontalLayout {
                 CheckBox { text: "Dark appearance"; checked <=> root.setting-dark; }
                 CheckBox { text: "Start with Windows"; checked <=> root.setting-startup; }
@@ -351,6 +367,58 @@ export component BoardWindow inherits Window {
                 Button { visible: root.import-pending; text: "Cancel"; clicked => { root.cancel-import(); } }
             }
             Text { visible: root.import-status != ""; text: root.import-status; color: root.board-muted; wrap: word-wrap; }
+            Rectangle { height: 1px; background: root.board-muted; opacity: 0.4; }
+            Text { text: "Google Calendar"; color: root.board-foreground; font-weight: 600; }
+            Text { text: root.calendar-status; color: root.board-muted; wrap: word-wrap; }
+            if root.calendar-configured && !root.calendar-connected && !root.calendar-setup-open: HorizontalLayout {
+                alignment: start;
+                Button { text: "Connect Google Calendar…"; clicked => { root.calendar-setup-open = true; } }
+            }
+            // First connect: choices, then the browser sign-in.
+            if root.calendar-setup-open: VerticalLayout {
+                spacing: 6px;
+                Text { text: "Reminders with a time become events in a new \"Sticky Notes\" calendar, so your phone can alert you."; color: root.board-foreground; wrap: word-wrap; }
+                CheckBox { text: "Add events for my existing timed reminders"; checked <=> root.calendar-sync-existing; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "Alert"; color: root.board-foreground; vertical-alignment: center; }
+                    ComboBox { model: ["At the reminder time", "10 minutes before", "20 minutes before", "30 minutes before", "1 hour before"]; current-index <=> root.calendar-alert-index; horizontal-stretch: 1; }
+                }
+                CheckBox { text: "Include note text (off sends only the title)"; checked <=> root.calendar-include-text; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    Button { text: "Cancel"; clicked => { root.calendar-setup-open = false; } }
+                    Button { text: "Continue in browser"; primary: true; clicked => { root.calendar-setup-open = false; root.calendar-connect(); } }
+                }
+            }
+            if root.calendar-connected && !root.calendar-confirm-disconnect: VerticalLayout {
+                spacing: 6px;
+                HorizontalLayout {
+                    spacing: 8px;
+                    Text { text: "Alert"; color: root.board-foreground; vertical-alignment: center; }
+                    ComboBox { model: ["At the reminder time", "10 minutes before", "20 minutes before", "30 minutes before", "1 hour before"]; current-index <=> root.calendar-alert-index; selected => { root.calendar-save-options(); } horizontal-stretch: 1; }
+                }
+                CheckBox { text: "Include note text (off sends only the title)"; checked <=> root.calendar-include-text; toggled => { root.calendar-save-options(); } }
+                Text { text: "Sync is one-way: changes made in Google are replaced when the note changes."; color: root.board-muted; wrap: word-wrap; font-size: 12px; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Button { text: "Sync now"; clicked => { root.calendar-sync-now(); } }
+                    Button { text: "Disconnect…"; clicked => { root.calendar-delete-calendar = false; root.calendar-confirm-disconnect = true; } }
+                }
+            }
+            if root.calendar-connected && root.calendar-confirm-disconnect: VerticalLayout {
+                spacing: 6px;
+                Text { text: "Disconnect Google Calendar? Reminders keep working on this PC."; color: root.board-foreground; wrap: word-wrap; }
+                CheckBox { text: "Also delete the Sticky Notes calendar from Google"; checked <=> root.calendar-delete-calendar; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: end;
+                    Button { text: "Cancel"; clicked => { root.calendar-confirm-disconnect = false; } }
+                    Button { text: "Disconnect"; clicked => { root.calendar-confirm-disconnect = false; root.calendar-disconnect(); } }
+                }
+            }
         }
         if root.navigation-open: VerticalLayout {
             spacing: 0px;
@@ -810,11 +878,16 @@ export component NoteWindow inherits Window {
                 }
             }
         }
-        if root.format-status != "": Text {
-            text: root.format-status;
-            font-size: 10px;
-            color: #66521b;
-            overflow: elide;
+        // Inset to line up with the note text and toolbar.
+        if root.format-status != "": HorizontalLayout {
+            padding-left: 10px;
+            padding-right: 10px;
+            Text {
+                text: root.format-status;
+                font-size: 10px;
+                color: root.note-foreground;
+                overflow: elide;
+            }
         }
         Rectangle {
             height: root.save-error ? 62px : 40px;

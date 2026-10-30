@@ -264,7 +264,7 @@ pub fn preview() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Not an editor acceptance sandbox".into());
     }
     if args[1] == "--editor-preview-fallback" {
-        std::env::remove_var("STICKY_NOTES_ENABLE_RICHEDIT");
+        std::env::set_var("STICKY_NOTES_ENABLE_RICHEDIT", "0");
     } else {
         std::env::set_var("STICKY_NOTES_ENABLE_RICHEDIT", "1");
     }

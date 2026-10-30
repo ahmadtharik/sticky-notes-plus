@@ -1,6 +1,9 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod acceptance_profile;
+mod calendar_sync;
+#[cfg(windows)]
+mod calendar_worker;
 mod checklist_presentation;
 mod content_identity;
 mod date_picker;
@@ -8,6 +11,7 @@ mod db;
 mod editor_history;
 #[cfg(windows)]
 mod editor_probe;
+mod google_calendar;
 mod hotkey;
 mod image_picker;
 mod inline_images;
@@ -1841,6 +1845,81 @@ fn restore_board_geometry(board: &BoardWindow, geometry: WindowGeometry) {
     }
 }
 
+/// Wire Settings' Google Calendar section to the background sync worker.
+/// Status arrives on the worker thread and is applied on the UI thread.
+#[cfg(windows)]
+fn setup_calendar(board: &BoardWindow, db: &Arc<Mutex<Db>>) {
+    use calendar_sync::ALERT_CHOICES;
+    use calendar_worker::{CalendarWorker, ConnectOptions, SyncStatus};
+    let alert_minutes = |index: i32| {
+        ALERT_CHOICES
+            .get(usize::try_from(index).unwrap_or(1))
+            .copied()
+            .unwrap_or(10)
+    };
+    board.set_calendar_configured(google_calendar::oauth_client().is_some());
+    let weak = board.as_weak();
+    let status_db = db.clone();
+    let worker = CalendarWorker::start(db.clone(), move |status| {
+        let weak = weak.clone();
+        let db = status_db.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(board) = weak.upgrade() else {
+                return;
+            };
+            let config = db
+                .lock()
+                .ok()
+                .and_then(|guard| calendar_sync::load_config(&guard.conn).ok().flatten());
+            board.set_calendar_connected(config.is_some() && status != SyncStatus::ReconnectNeeded);
+            if let Some(config) = config {
+                let index = ALERT_CHOICES
+                    .iter()
+                    .position(|minutes| *minutes == config.alert_minutes)
+                    .unwrap_or(1);
+                board.set_calendar_alert_index(index as i32);
+                board.set_calendar_include_text(config.include_note_text);
+            }
+            board.set_calendar_status(status.text().into());
+        });
+    });
+    let weak = board.as_weak();
+    let connect_worker = worker.clone();
+    board.on_calendar_connect(move || {
+        if let Some(board) = weak.upgrade() {
+            connect_worker.connect(ConnectOptions {
+                sync_existing: board.get_calendar_sync_existing(),
+                alert_minutes: alert_minutes(board.get_calendar_alert_index()),
+                include_note_text: board.get_calendar_include_text(),
+            });
+        }
+    });
+    let weak = board.as_weak();
+    let options_db = db.clone();
+    let options_worker = worker.clone();
+    board.on_calendar_save_options(move || {
+        let Some(board) = weak.upgrade() else {
+            return;
+        };
+        match calendar_worker::update_options(
+            &options_db,
+            alert_minutes(board.get_calendar_alert_index()),
+            board.get_calendar_include_text(),
+        ) {
+            Ok(()) => options_worker.settings_changed(),
+            Err(error) => board.set_calendar_status(format!("Could not save: {error}").into()),
+        }
+    });
+    let sync_worker = worker.clone();
+    board.on_calendar_sync_now(move || sync_worker.sync_now());
+    let weak = board.as_weak();
+    board.on_calendar_disconnect(move || {
+        if let Some(board) = weak.upgrade() {
+            worker.disconnect(board.get_calendar_delete_calendar());
+        }
+    });
+}
+
 /// Persist board moves and resizes, debounced so a drag writes once.
 #[cfg(windows)]
 fn track_board_geometry(board: &BoardWindow, db: &Arc<Mutex<Db>>) {
@@ -2207,6 +2286,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .flatten();
         BOARD_RESTORE.with(|pending| *pending.borrow_mut() = WindowGeometry::from_db(saved));
         track_board_geometry(&board, &db);
+        setup_calendar(&board, &db);
     }
     board.set_setting_dark(preferences.dark_theme);
     board.set_setting_shortcut(preferences.shortcut.clone().into());
@@ -3696,10 +3776,10 @@ fn open_editor(
     }
     #[cfg(windows)]
     let native_editor = {
-        // The child-control path stays opt-in until the manual visual/DPI
-        // acceptance pass is recorded. It is a real editor, not a preview,
-        // but not yet the default replacement for the established TextInput.
-        if std::env::var_os("STICKY_NOTES_ENABLE_RICHEDIT").is_none() {
+        // The native RichEdit editor is the default (date chips, mixed
+        // formatting). STICKY_NOTES_ENABLE_RICHEDIT=0 selects the Slint
+        // TextInput fallback, which is also used if the control cannot attach.
+        if std::env::var("STICKY_NOTES_ENABLE_RICHEDIT").is_ok_and(|value| value == "0") {
             None
         } else {
             let weak_native_change = editor.as_weak();
