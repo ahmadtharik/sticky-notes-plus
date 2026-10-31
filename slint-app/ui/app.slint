@@ -4,6 +4,8 @@ export struct NoteCard {
     id: string,
     title: string,
     preview: string,
+    // Second preview line; each line is elided rather than clipped.
+    preview-more: string,
     color: color,
     pinned: bool,
     updated-label: string,
@@ -140,6 +142,8 @@ component NoteAction inherits Rectangle {
     in property <image> icon;
     in property <length> text-size: 16px;
     callback clicked();
+    // Hover text for a tooltip: the label on enter, empty on leave or click.
+    callback tip(string);
     callback focus-editor();
     in property <bool> keyboard-editor-navigation: false;
     public function focus-action() { keyboard.focus(); }
@@ -163,7 +167,7 @@ component NoteAction inherits Rectangle {
             reject
         }
     }
-    hit := TouchArea { enabled: root.action-enabled; width: parent.width; height: parent.height; clicked => { root.clicked(); } }
+    hit := TouchArea { enabled: root.action-enabled; width: parent.width; height: parent.height; clicked => { root.tip(""); root.clicked(); } changed has-hover => { root.tip(self.has-hover ? root.label : ""); } }
     Text {
         visible: !root.has-icon || root.menu-row;
         x: root.menu-row ? (root.has-icon ? 48px : 16px) : 0px;
@@ -596,7 +600,7 @@ export component BoardWindow inherits Window {
                 border-color: self.emphasized ? root.board-foreground : #00000018;
                 horizontal-stretch: 1;
                 min-width: 0px;
-                height: root.card-menu-id == card.id ? 152px : 112px;
+                height: root.card-menu-id == card.id ? 160px : 120px;
                 accessible-role: button;
                 accessible-label: card.title;
                 accessible-action-default => { if (root.board-view != "deleted") { root.open-note(card.id); } }
@@ -635,14 +639,20 @@ export component BoardWindow inherits Window {
                 }
                 VerticalLayout {
                     padding: 16px;
-                    spacing: 8px;
+                    padding-top: 12px;
+                    spacing: 6px;
                     HorizontalLayout {
                         Text { text: card.updated-label; color: card.color == #454545 ? #dddddd : #64635e; font-size: 11px; overflow: elide; horizontal-stretch: 1; vertical-alignment: center; }
                         if card.pinned: Image { source: @image-url("icons/star.svg"); colorize: card.color == #454545 ? #e0e1e4 : #454854; width: 14px; height: 14px; y: (28px - self.height) / 2; accessible-role: text; accessible-label: "Pinned"; }
                         NoteAction { text: "···"; label: "Options for " + (card.title == "" ? "Untitled note" : card.title); foreground: card.color == #454545 ? #f5f5f6 : #32343d; width: 28px; height: 28px; clicked => { root.card-menu-id = root.card-menu-id == card.id ? "" : card.id; } }
                     }
                     Text { text: card.title; color: card.color == #454545 ? #f5f5f6 : #32343d; font-size: 14px; overflow: elide; }
-                    Text { text: card.preview == "" ? "Empty note" : card.preview; color: card.color == #454545 ? #e0e1e4 : #454854; font-size: 14px; vertical-stretch: 1; overflow: elide; wrap: word-wrap; min-width: 0px; }
+                    VerticalLayout {
+                        spacing: 2px;
+                        Text { text: card.preview == "" ? "Empty note" : card.preview; color: card.color == #454545 ? #e0e1e4 : #454854; font-size: 14px; overflow: elide; min-width: 0px; }
+                        Text { text: card.preview-more; color: card.color == #454545 ? #e0e1e4 : #454854; font-size: 14px; overflow: elide; min-width: 0px; }
+                    }
+                    Rectangle { vertical-stretch: 1; }
                     if root.card-menu-id == card.id: HorizontalLayout {
                         spacing: 5px;
                         if root.board-view == "notes": NoteAction { text: card.pinned ? "Unpin" : "Pin"; width: 54px; height: 32px; text-size: 13px; foreground: card.color == #454545 ? #f5f5f6 : #32343d; clicked => { root.toggle-pin(card.id, !card.pinned); } }
@@ -780,6 +790,7 @@ export component NoteWindow inherits Window {
     callback focus-native-editor();
     public function focus-toolbar() { bold-action.focus-action(); }
     callback editor-history-action(bool);
+    callback toolbar-tip(string);
     callback select-date-occurrence(int);
     callback apply-date-selection();
     callback remove-selected-date();
@@ -962,15 +973,18 @@ export component NoteWindow inherits Window {
                 height: 40px;
                 padding-left: 4px;
                 spacing: 0px;
-                bold-action := NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "B"; label: "Bold"; emphasis: true; width: 32px; clicked => { root.toggle-selection-style("bold", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
-                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "I"; italic: true; label: "Italic"; width: 32px; clicked => { root.toggle-selection-style("italic", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
-                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/underline.svg"); label: "Underline"; width: 32px; clicked => { root.toggle-selection-style("underline", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
-                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/strikethrough.svg"); label: "Strikethrough"; width: 32px; clicked => { root.toggle-selection-style("strike", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
-                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/list.svg"); label: "Bullet list"; width: 32px; clicked => { editor-input.apply-list("bullet"); } }
-                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/image.svg"); label: "Add image"; width: 32px; clicked => { root.add-image(); } }
-                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/checklist.svg"); label: "Checklist"; width: 32px; clicked => { editor-input.apply-list("checklist"); } }
-                NoteAction { keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/calendar.svg"); label: "Date picker"; width: 32px; clicked => { root.toggle-date-panel(); } }
+                bold-action := NoteAction { tip(text) => { root.toolbar-tip(text); } keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "B"; label: "Bold"; emphasis: true; width: 32px; clicked => { root.toggle-selection-style("bold", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                NoteAction { tip(text) => { root.toolbar-tip(text); } keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; text: "I"; italic: true; label: "Italic"; width: 32px; clicked => { root.toggle-selection-style("italic", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                NoteAction { tip(text) => { root.toolbar-tip(text); } keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/underline.svg"); label: "Underline"; width: 32px; clicked => { root.toggle-selection-style("underline", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                NoteAction { tip(text) => { root.toolbar-tip(text); } keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/strikethrough.svg"); label: "Strikethrough"; width: 32px; clicked => { root.toggle-selection-style("strike", editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); editor-input.restore-selection(editor-input.anchor-byte-offset, editor-input.cursor-byte-offset); } }
+                NoteAction { tip(text) => { root.toolbar-tip(text); } keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/list.svg"); label: "Bullet list"; width: 32px; clicked => { editor-input.apply-list("bullet"); } }
+                NoteAction { tip(text) => { root.toolbar-tip(text); } keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/image.svg"); label: "Add image"; width: 32px; clicked => { root.add-image(); } }
+                NoteAction { tip(text) => { root.toolbar-tip(text); } keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/checklist.svg"); label: "Checklist"; width: 32px; clicked => { editor-input.apply-list("checklist"); } }
+                NoteAction { tip(text) => { root.toolbar-tip(text); } keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/calendar.svg"); label: "Date picker"; width: 32px; clicked => { root.toggle-date-panel(); } }
                 Rectangle { horizontal-stretch: 1; }
+                // Only where they fit beside the other tools at narrow widths.
+                if root.native-editor-active && root.width >= 324px: NoteAction { tip(text) => { root.toolbar-tip(text); } keyboard-editor-navigation: true; focus-editor => { root.focus-native-editor(); } foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/undo.svg"); label: "Undo"; width: 32px; clicked => { root.editor-history-action(false); } }
+                if root.native-editor-active && root.width >= 324px: NoteAction { tip(text) => { root.toolbar-tip(text); } keyboard-editor-navigation: true; focus-editor => { root.focus-native-editor(); } foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/redo.svg"); label: "Redo"; width: 32px; clicked => { root.editor-history-action(true); } }
             }
             if root.save-error: HorizontalLayout {
                 height: 22px;
@@ -983,9 +997,11 @@ export component NoteWindow inherits Window {
     // This is an overlay, not a layout child: opening it never moves the
     // editor or the bottom toolbar. The full-width menu mirrors Windows
     // Sticky Notes and gives each color a large, keyboard-reachable target.
+    // Starts below the 32px header so "+", "···" and × stay usable.
     if root.overflow-open: Rectangle {
+        y: 32px;
         width: parent.width;
-        height: parent.height;
+        height: parent.height - 32px;
         background: #00000000;
         TouchArea {
             width: parent.width;

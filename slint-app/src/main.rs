@@ -26,6 +26,8 @@ mod notification;
 #[cfg(windows)]
 mod reliability_probe;
 mod settings;
+#[cfg(windows)]
+mod tooltip;
 mod tray;
 #[cfg(windows)]
 mod window_chrome;
@@ -1704,10 +1706,13 @@ fn refresh(board: &BoardWindow, db: &Arc<Mutex<Db>>, query: &str) {
                 Some(date) => date.format("%b %d").to_string(),
                 None => String::new(),
             };
+            let (first, more) = preview.split_once('\n').unwrap_or((&preview, ""));
+            let more = more.lines().next().unwrap_or("");
             NoteCard {
                 id: note.id.into(),
                 title: note.title.unwrap_or_else(|| "Untitled note".into()).into(),
-                preview: preview.into(),
+                preview: first.into(),
+                preview_more: more.into(),
                 color: color(&note.color),
                 pinned: note.is_pinned,
                 updated_label: updated_label.into(),
@@ -1758,7 +1763,11 @@ fn due_reminders_from_rows(
             };
             due.push(DueReminder {
                 id: reminder.id,
-                title: note.title.unwrap_or_default(),
+                // The due line already shows the date.
+                title: calendar_sync::without_date_labels(
+                    &note.content,
+                    &note.title.unwrap_or_default(),
+                ),
                 label,
                 due_label: date_label(&if reminder.due_time.is_empty() {
                     reminder.scheduled_date
@@ -3106,6 +3115,37 @@ fn open_editor(
                 native.history_action(redo);
             }
         });
+        let tip_window = editor.as_weak();
+        let tip_timer = Rc::new(Timer::default());
+        let tip: Rc<RefCell<Option<tooltip::Tooltip>>> = Rc::new(RefCell::new(None));
+        editor.on_toolbar_tip(move |text| {
+            tip_timer.stop();
+            if text.is_empty() {
+                if let Some(tip) = tip.borrow().as_ref() {
+                    tip.hide();
+                }
+                return;
+            }
+            let tip = tip.clone();
+            let window = tip_window.clone();
+            tip_timer.start(
+                TimerMode::SingleShot,
+                std::time::Duration::from_millis(500),
+                move || {
+                    let mut slot = tip.borrow_mut();
+                    if slot.is_none() {
+                        *slot = window.upgrade().and_then(|window| {
+                            native_rich_editor::parent_hwnd(window.window())
+                                .ok()
+                                .and_then(tooltip::Tooltip::new)
+                        });
+                    }
+                    if let Some(tip) = slot.as_ref() {
+                        tip.show(&text);
+                    }
+                },
+            );
+        });
     }
 
     let weak_saved_editor = weak_editor.clone();
@@ -3682,7 +3722,9 @@ fn open_editor(
         flush_pending_native_change(&save_state_for_list_command);
         let source = window.get_editor_text().to_string();
         #[cfg(windows)]
-        let (anchor, cursor) = native_for_list_command.borrow().as_ref()
+        let (anchor, cursor) = native_for_list_command
+            .borrow()
+            .as_ref()
             .map(|native| native.selection_byte_offsets(&source))
             .unwrap_or((anchor, cursor));
         let start = usize::try_from(anchor).unwrap_or(usize::MAX);
@@ -3693,17 +3735,19 @@ fn open_editor(
         let mut formats = parse_format_ranges(&window.get_editor_bold_ranges());
         remap_formats_after_replacements(&source, &result.replacements, &mut formats);
         let serialized = serialize_format_ranges(&formats);
-        apply_editor_state(&window, &result.source, window.get_editor_bold(), &serialized);
+        apply_editor_state(
+            &window,
+            &result.source,
+            window.get_editor_bold(),
+            &serialized,
+        );
         #[cfg(windows)]
         if let Some(native) = native_for_list_command.borrow().as_ref() {
             native.set_document(&native_document_from_editor(&window));
             native.restore_selection(&result.source, result.caret, result.caret);
         }
         remember_editor_text(&save_state_for_list_command, &result.source);
-        window.set_format_status(
-            "List structure saved. Task checkboxes below remain a preview while editing stays native text."
-                .into(),
-        );
+        window.set_format_status("".into());
         mark_editor_dirty(&window, &save_state_for_list_command);
         flush_editor(
             &db_list_command,
@@ -4241,7 +4285,7 @@ mod editor_tests {
 
         let displayed = due_reminders(&db.conn, due).unwrap();
         assert_eq!(displayed.len(), 2);
-        assert_eq!(displayed[0].title, "Call client Sep 18");
+        assert_eq!(displayed[0].title, "Call client");
         assert_eq!(displayed[0].label, "");
         assert_eq!(displayed[0].due_label, "Sep 18");
 

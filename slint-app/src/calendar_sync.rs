@@ -209,7 +209,7 @@ pub fn desired_events(
 /// The note text without its date-chip labels ("Dentist Oct 28 · 21:00" →
 /// "Dentist"). Labels are found in the content JSON and removed once each
 /// from the plain text, so ordinary words that match are untouched.
-fn without_date_labels(content: &str, plain: &str) -> String {
+pub(crate) fn without_date_labels(content: &str, plain: &str) -> String {
     fn labels(value: &Value, out: &mut Vec<String>) {
         match value {
             Value::Object(map) => {

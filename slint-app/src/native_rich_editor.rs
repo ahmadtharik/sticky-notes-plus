@@ -1171,7 +1171,7 @@ fn document_weight(document: &NativeDocument) -> usize {
             * 16
 }
 
-fn parent_hwnd(window: &slint::Window) -> Result<HWND, String> {
+pub(crate) fn parent_hwnd(window: &slint::Window) -> Result<HWND, String> {
     let slint_handle = window.window_handle();
     let handle = slint_handle
         .window_handle()
