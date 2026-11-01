@@ -264,6 +264,7 @@ export struct ReminderCard {
 }
 
 export component BoardWindow inherits Window {
+    icon: @image-url("icons/app-icon.png");
     title: "Sticky Notes+";
     preferred-width: 400px;
     preferred-height: 620px;
@@ -298,6 +299,18 @@ export component BoardWindow inherits Window {
     callback calendar-save-options();
     callback calendar-sync-now();
     callback calendar-disconnect();
+    // Updates: checked only from Settings, installed only when asked.
+    in-out property <string> update-version;
+    in-out property <string> update-status;
+    in-out property <bool> update-available: false;
+    in-out property <bool> update-busy: false;
+    callback check-for-updates();
+    callback install-update();
+    callback finish-update(string);
+    in-out property <string> export-status;
+    // An import or export is running in the background.
+    in-out property <bool> data-busy: false;
+    callback export-notes();
     in-out property <bool> import-pending: false;
     in-out property <string> import-status;
     callback preview-import();
@@ -379,44 +392,53 @@ export component BoardWindow inherits Window {
             NoteAction { text: "Notes"; menu-row: true; foreground: root.board-foreground; emphasis: root.board-view == "notes"; height: 32px; clicked => { root.card-menu-id = ""; root.navigation-open = false; root.select-board-view("notes"); } }
             NoteAction { text: "Archive"; menu-row: true; foreground: root.board-foreground; emphasis: root.board-view == "archive"; height: 32px; clicked => { root.card-menu-id = ""; root.navigation-open = false; root.select-board-view("archive"); } }
             NoteAction { text: "Deleted"; menu-row: true; foreground: root.board-foreground; emphasis: root.board-view == "deleted"; height: 32px; clicked => { root.card-menu-id = ""; root.navigation-open = false; root.select-board-view("deleted"); } }
-            NoteAction { text: "Reminders"; menu-row: true; foreground: root.board-foreground; height: 32px; clicked => { root.reminder-panel-open = !root.reminder-panel-open; root.navigation-open = false; } }
-            NoteAction { text: "Settings"; menu-row: true; foreground: root.board-foreground; height: 32px; clicked => { root.settings-open = true; root.setting-dark = root.dark-theme; root.settings-status = ""; root.reminder-panel-open = false; root.navigation-open = false; } }
+            NoteAction { text: "Reminders"; menu-row: true; foreground: root.board-foreground; height: 32px; clicked => { root.reminder-panel-open = !root.reminder-panel-open; root.navigation-open = false; if (root.reminder-panel-open && root.board-view != "notes") { root.select-board-view("notes"); } } }
+            NoteAction { text: "Settings"; menu-row: true; foreground: root.board-foreground; height: 32px; clicked => { root.settings-open = true; root.setting-dark = root.dark-theme; root.settings-status = ""; root.reminder-panel-open = false; root.navigation-open = false; root.check-for-updates(); } }
         }
         if root.reminder-error != "": HorizontalLayout {
             Text { text: root.reminder-error; color: root.board-error; wrap: word-wrap; horizontal-stretch: 1; }
             Button { text: "Dismiss"; clicked => { root.reminder-error = ""; } }
         }
-        if root.reminder-panel-open && !root.settings-open && due-reminders.length > 0: Rectangle {
-            height: min(240px, root.height * 0.38);
+        if root.reminder-panel-open && !root.settings-open && root.board-view == "notes" && due-reminders.length > 0: Rectangle {
+            height: min(150px, root.height * 0.35);
             background: root.dark-theme ? #3a3322 : #fff7d6;
             border-width: 1px;
             border-color: root.dark-theme ? #8a7434 : #d8bc63;
             border-radius: 10px;
             clip: true;
             VerticalLayout {
-                padding: 12px;
-                spacing: 10px;
-                Text {
-                    text: "Due reminders";
-                    font-size: 14px;
-                    font-weight: 700;
-                    color: root.dark-theme ? #f3dfa0 : #66521b;
+                padding: 10px;
+                spacing: 6px;
+                HorizontalLayout {
+                    Text {
+                        text: "Due reminders";
+                        font-size: 14px;
+                        font-weight: 700;
+                        color: root.dark-theme ? #f3dfa0 : #66521b;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    NoteAction { text: "×"; label: "Hide due reminders"; foreground: root.dark-theme ? #f3dfa0 : #66521b; width: 24px; height: 24px; clicked => { root.reminder-panel-open = false; } }
                 }
                 ScrollView {
                     viewport-width: self.visible-width;
                     VerticalLayout {
-                    spacing: 10px;
+                    padding-right: 10px;
+                    spacing: 6px;
                     for reminder in due-reminders: Rectangle {
-                        height: 112px;
+                        height: 72px;
                         min-width: 0px;
                         horizontal-stretch: 1;
                         background: root.dark-theme ? #00000040 : #ffffff99;
                         border-radius: 6px;
                         VerticalLayout {
-                            padding: 10px;
-                            spacing: 7px;
+                            padding: 8px;
+                            spacing: 6px;
+                            HorizontalLayout {
+                            spacing: 8px;
                             Text {
                                 text: reminder.title == "" ? "Untitled note" : reminder.title;
+                                horizontal-stretch: 1;
                                 color: root.dark-theme ? #f3dfa0 : #66521b;
                                 min-width: 0px;
                                 font-size: 13px;
@@ -426,12 +448,13 @@ export component BoardWindow inherits Window {
                             }
                             Text {
                                 text: reminder.label == "" ? reminder.due-label : reminder.label + " · " + reminder.due-label;
-                                horizontal-stretch: 1;
+                                horizontal-stretch: 0;
                                 color: root.dark-theme ? #e0cf9e : #695b35;
                                 min-width: 0px;
                                 font-size: 12px;
                                 overflow: elide;
                                 vertical-alignment: center;
+                            }
                             }
                             HorizontalLayout {
                                 spacing: 8px;
@@ -570,17 +593,36 @@ export component BoardWindow inherits Window {
                 }
                 }
                 SettingsSection {
+                    title: "Updates";
+                    foreground: root.board-foreground;
+                    dark: root.dark-theme;
+                    Text { text: root.update-version; color: root.board-muted; font-size: 12px; }
+                    if root.update-status != "": Text { text: root.update-status; color: root.board-foreground; wrap: word-wrap; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        Button { text: "Check for updates"; enabled: !root.update-busy; clicked => { root.check-for-updates(); } }
+                        if root.update-available: Button { text: "Install update"; primary: true; enabled: !root.update-busy; clicked => { root.install-update(); } }
+                    }
+                }
+                SettingsSection {
                     title: "Data";
                     foreground: root.board-foreground;
                     dark: root.dark-theme;
                     HorizontalLayout {
                         spacing: 8px;
                         alignment: start;
-                        Button { text: "Import Tauri notes…"; clicked => { root.preview-import(); } }
-                        Button { visible: root.import-pending; text: "Confirm import"; clicked => { root.confirm-import(); } }
-                        Button { visible: root.import-pending; text: "Cancel"; clicked => { root.cancel-import(); } }
+                        Button { text: "Export notes…"; enabled: !root.data-busy; clicked => { root.export-notes(); } }
+                        Button { text: "Import from export…"; enabled: !root.data-busy; clicked => { root.preview-import(); } }
                     }
+                    if root.export-status != "": Text { text: root.export-status; color: root.board-muted; wrap: word-wrap; }
                     if root.import-status != "": Text { text: root.import-status; color: root.board-muted; wrap: word-wrap; }
+                    if root.import-pending: HorizontalLayout {
+                        spacing: 8px;
+                        alignment: start;
+                        Button { text: "Add notes"; primary: true; clicked => { root.confirm-import(); } }
+                        Button { text: "Cancel"; clicked => { root.cancel-import(); } }
+                    }
                 }
             }
         }
@@ -649,7 +691,7 @@ export component BoardWindow inherits Window {
                     Text { text: card.title; color: card.color == #454545 ? #f5f5f6 : #32343d; font-size: 14px; overflow: elide; }
                     VerticalLayout {
                         spacing: 2px;
-                        Text { text: card.preview == "" ? "Empty note" : card.preview; color: card.color == #454545 ? #e0e1e4 : #454854; font-size: 14px; overflow: elide; min-width: 0px; }
+                        Text { text: card.preview == "" && card.title == "Untitled note" ? "Empty note" : card.preview; color: card.color == #454545 ? #e0e1e4 : #454854; font-size: 14px; overflow: elide; min-width: 0px; }
                         Text { text: card.preview-more; color: card.color == #454545 ? #e0e1e4 : #454854; font-size: 14px; overflow: elide; min-width: 0px; }
                     }
                     Rectangle { vertical-stretch: 1; }
@@ -697,6 +739,7 @@ export component DragGhostWindow inherits Window {
 }
 
 export component NoteWindow inherits Window {
+    icon: @image-url("icons/app-icon.png");
     in-out property <bool> frameless: false;
     no-frame: root.frameless;
     always-on-top: root.note-always-on-top;
@@ -791,6 +834,7 @@ export component NoteWindow inherits Window {
     public function focus-toolbar() { bold-action.focus-action(); }
     callback editor-history-action(bool);
     callback toolbar-tip(string);
+    in-out property <[string]> week-labels: ["M", "T", "W", "T", "F", "S", "S"];
     callback select-date-occurrence(int);
     callback apply-date-selection();
     callback remove-selected-date();
@@ -1104,7 +1148,7 @@ export component NoteWindow inherits Window {
                 VerticalLayout {
                     spacing: 0px;
                     HorizontalLayout {
-                        for label in ["M", "T", "W", "T", "F", "S", "S"]: Text { text: label; horizontal-stretch: 1; horizontal-alignment: center; color: #6b7080; font-size: 10px; }
+                        for label in root.week-labels: Text { text: label; horizontal-stretch: 1; horizontal-alignment: center; color: #6b7080; font-size: 10px; }
                     }
                     for week in root.calendar-weeks: HorizontalLayout {
                         for day in week.days: Rectangle {

@@ -14,7 +14,8 @@ try {
     $releaseDirectory = Join-Path $applicationRoot 'target\release'
     $installerDirectory = Join-Path $applicationRoot 'target\installer'
     New-Item -ItemType Directory -Path $installerDirectory -Force | Out-Null
-    $buildArguments = @('build', (Join-Path $PSScriptRoot 'installer.wxs'), '-arch', 'x64', '-d', "SourceDir=$releaseDirectory", '-d', "IdentityFile=$(Join-Path $PSScriptRoot 'notification-identity.txt')", '-o', (Join-Path $installerDirectory 'StickyNotesPlus.msi'))
+    $version = (Select-String -LiteralPath (Join-Path $applicationRoot 'Cargo.toml') -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+    $buildArguments = @('build', (Join-Path $PSScriptRoot 'installer.wxs'), '-arch', 'x64', '-d', "ProductVersion=$version", '-d', "IconFile=$(Join-Path $PSScriptRoot 'app.ico')", '-d', "SourceDir=$releaseDirectory", '-d', "IdentityFile=$(Join-Path $PSScriptRoot 'notification-identity.txt')", '-o', (Join-Path $installerDirectory 'StickyNotesPlus.msi'))
     if ($wixTool) { & $wixTool.Source @buildArguments } else { & dotnet $WixDll @buildArguments }
     if ($LASTEXITCODE -ne 0) { throw 'Installer build failed.' }
     Write-Output (Join-Path $installerDirectory 'StickyNotesPlus.msi')

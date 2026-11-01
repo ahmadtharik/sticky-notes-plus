@@ -544,10 +544,7 @@ pub fn sync_once(
 ) -> Result<SyncSummary, SyncError> {
     let mut summary = SyncSummary::default();
     for attempt in 0..2 {
-        let lock = || {
-            db.lock()
-                .map_err(|_| SyncError::Other("Database lock unavailable".into()))
-        };
+        let lock = || Ok::<_, SyncError>(crate::db::lock(db));
         let (config, operations) = {
             let guard = lock()?;
             let config = calendar_sync::load_config(&guard.conn)
@@ -598,10 +595,7 @@ fn apply(
 ) -> Result<(), SyncError> {
     let record =
         |result: rusqlite::Result<()>| result.map_err(|error| SyncError::Other(error.to_string()));
-    let lock = || {
-        db.lock()
-            .map_err(|_| SyncError::Other("Database lock unavailable".into()))
-    };
+    let lock = || Ok::<_, SyncError>(crate::db::lock(db));
     for operation in operations {
         match operation {
             SyncOp::Create(spec) => {
@@ -824,9 +818,29 @@ mod windows_impl {
             filter
                 .CacheControl()?
                 .SetReadBehavior(HttpCacheReadBehavior::NoCache)?;
-            Ok(Self {
-                client: windows::Web::Http::HttpClient::Create(&filter)?,
-            })
+            let client = windows::Web::Http::HttpClient::Create(&filter)?;
+            // GitHub rejects requests without a User-Agent.
+            client
+                .DefaultRequestHeaders()?
+                .UserAgent()?
+                .TryParseAdd(&HSTRING::from("StickyNotesPlus"))?;
+            Ok(Self { client })
+        }
+
+        /// Fetches a binary file, following redirects.
+        pub fn download(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+            let uri = windows::Foundation::Uri::CreateUri(&HSTRING::from(url))?;
+            let response = self
+                .client
+                .GetAsync(&uri)?
+                .get()
+                .context("No response from the server")?;
+            let status = response.StatusCode()?.0;
+            anyhow::ensure!(status == 200, "The server answered {status}");
+            let buffer = response.Content()?.ReadAsBufferAsync()?.get()?;
+            let mut bytes = vec![0u8; buffer.Length()? as usize];
+            windows::Storage::Streams::DataReader::FromBuffer(&buffer)?.ReadBytes(&mut bytes)?;
+            Ok(bytes)
         }
     }
 
@@ -869,7 +883,7 @@ mod windows_impl {
                 .client
                 .SendRequestAsync(&message)?
                 .get()
-                .context("No response from Google")?;
+                .context("No response from the server")?;
             let status = response.StatusCode()?.0 as u16;
             let body = response.Content()?.ReadAsStringAsync()?.get()?.to_string();
             Ok(HttpResponse { status, body })

@@ -204,8 +204,7 @@ pub(crate) fn reconcile_note_in_transaction(
     if keep.is_empty() {
         conn.execute("DELETE FROM reminders WHERE note_id=?1", [note_id])?;
     } else {
-        let placeholders = std::iter::repeat("?")
-            .take(keep.len())
+        let placeholders = std::iter::repeat_n("?", keep.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql =
@@ -218,6 +217,7 @@ pub(crate) fn reconcile_note_in_transaction(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn reconcile_note(conn: &Connection, note_id: &str, content: &str) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
     reconcile_note_in_transaction(&tx, note_id, content)?;
@@ -274,6 +274,7 @@ pub fn due_at(conn: &Connection, as_of: DateTime<Local>) -> rusqlite::Result<Vec
 }
 
 /// Date-only compatibility for existing deterministic tests and callers.
+#[cfg(test)]
 pub fn due_on(conn: &Connection, as_of: NaiveDate) -> rusqlite::Result<Vec<ReminderRow>> {
     use chrono::TimeZone;
     let end = as_of.and_hms_opt(23, 59, 0).unwrap();

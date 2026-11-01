@@ -1,9 +1,13 @@
 [package]
 name = "sticky-notes-plus-slint"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-rust-version = "1.77.2"
+rust-version = "1.82"
 description = "Native Slint implementation of Sticky Notes+"
+
+[features]
+# Probes and soak tests used for acceptance runs; never in release installers.
+dev-tools = []
 
 [dependencies]
 anyhow = "1.0"
@@ -21,7 +25,7 @@ uuid = { version = "1", features = ["v4"] }
 tray-icon = { version = "0.24.2", default-features = false }
 # RegisterHotKey is part of the Win32 API, so the global shortcut has no
 # secondary GUI runtime and hands work back to Slint through a channel.
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_System_DataExchange", "Win32_System_Registry", "Win32_System_LibraryLoader", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_Controls", "Win32_UI_Controls_Dialogs", "Win32_UI_Input_Ime", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Memory", "Win32_System_DataExchange", "Win32_System_Registry", "Win32_System_LibraryLoader", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_Controls", "Win32_UI_Controls_Dialogs", "Win32_UI_Input_Ime", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 # This is the public, sealed Winit accessor supplied by Slint's selected
 # backend. It lets the native RichEdit child follow its Slint parent on resize;
 # no private Slint APIs or second event loop are used.

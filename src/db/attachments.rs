@@ -21,7 +21,7 @@ pub struct Attachment {
     pub height: u32,
 }
 
-fn storage(conn: &Connection) -> Result<PathBuf> {
+pub(crate) fn storage(conn: &Connection) -> Result<PathBuf> {
     let database = conn
         .path()
         .filter(|p| !p.is_empty())
@@ -44,10 +44,18 @@ fn storage(conn: &Connection) -> Result<PathBuf> {
 }
 
 pub fn thumbnail_path(conn: &Connection, id: &str) -> Result<PathBuf> {
+    stored_path(conn, id, "thumb.png")
+}
+
+pub fn original_path(conn: &Connection, id: &str) -> Result<PathBuf> {
+    stored_path(conn, id, "original")
+}
+
+fn stored_path(conn: &Connection, id: &str, kind: &str) -> Result<PathBuf> {
     let uuid = uuid::Uuid::parse_str(id)?;
     ensure!(uuid.to_string() == id, "Invalid attachment identifier");
     let root = storage(conn)?;
-    let path = root.join(format!("{id}.thumb.png"));
+    let path = root.join(format!("{id}.{kind}"));
     ensure!(
         !std::fs::symlink_metadata(&path)?.file_type().is_symlink(),
         "Attachment cannot be a link"
@@ -237,6 +245,53 @@ pub fn prepare_bytes(bytes: Vec<u8>, name: &str) -> Result<PreparedImage> {
         thumbnail: thumbnail.into_inner(),
     })
 }
+pub fn exists(conn: &Connection, id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attachments WHERE id=?1)",
+        [id],
+        |r| r.get(0),
+    )?)
+}
+
+/// Writes a restored image's files under its original ID. New files are pushed
+/// to `created` so the caller can remove them if the restore fails.
+pub fn store_files(
+    root: &Path,
+    id: &str,
+    prepared: PreparedImage,
+    created: &mut Vec<PathBuf>,
+) -> Result<Attachment> {
+    for (suffix, data) in [
+        ("original", prepared.bytes.as_slice()),
+        ("thumb.png", prepared.thumbnail.as_slice()),
+    ] {
+        let path = root.join(format!("{id}.{suffix}"));
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        created.push(path);
+        output.write_all(data)?;
+        output.sync_all()?;
+    }
+    Ok(prepared.item)
+}
+
+pub fn insert_row(
+    conn: &Connection,
+    note_id: &str,
+    id: &str,
+    name: &str,
+    item: &Attachment,
+) -> Result<()> {
+    let name: String = name.chars().take(200).collect();
+    conn.execute(
+        "INSERT INTO attachments(id,note_id,name,mime,bytes,width,height) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+        params![id, note_id, name, item.mime, item.bytes, item.width, item.height],
+    )?;
+    Ok(())
+}
+
 pub fn commit_prepared(
     conn: &Connection,
     note_id: &str,

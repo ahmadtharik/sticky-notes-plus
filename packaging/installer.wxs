@@ -1,8 +1,10 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Package Name="Sticky Notes+" Manufacturer="Sticky Notes Plus" Version="0.1.0"
+  <Package Name="Sticky Notes+" Manufacturer="Sticky Notes Plus" Version="$(var.ProductVersion)"
            UpgradeCode="953ECAB2-473D-4D44-85F8-75A8E49DB2B2" Scope="perUser">
     <MajorUpgrade DowngradeErrorMessage="A newer Sticky Notes+ version is already installed." />
     <MediaTemplate EmbedCab="yes" />
+    <Icon Id="AppIcon.ico" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
     <StandardDirectory Id="LocalAppDataFolder">
       <Directory Id="ProgramsFolder" Name="Programs">
         <Directory Id="INSTALLFOLDER" Name="Sticky Notes Plus">
@@ -24,7 +26,7 @@
     </StandardDirectory>
     <StandardDirectory Id="ProgramMenuFolder">
       <Component Id="StartShortcut" Guid="194A4834-91A2-4CB0-A145-9409606FC42A">
-        <Shortcut Id="StartMenuShortcut" Name="Sticky Notes+" Target="[#StickyExe]" WorkingDirectory="INSTALLFOLDER">
+        <Shortcut Id="StartMenuShortcut" Name="Sticky Notes+" Target="[#StickyExe]" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon.ico">
           <ShortcutProperty Key="System.AppUserModel.ID" Value="StickyNotesPlus.Native" />
           <!-- Reminder buttons use the app-owned URL protocol. Do not advertise a
                ToastActivatorCLSID without a real COM server registration. -->

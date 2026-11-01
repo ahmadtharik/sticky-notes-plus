@@ -182,7 +182,7 @@ impl Projection {
             let matches_label = |bounds: (usize, usize)| {
                 let start = byte_at_unit(control, bounds.0)?;
                 let end = byte_at_unit(control, bounds.1)?;
-                (&control[start..end] == label || (image && &control[start..end] == "□"))
+                (control[start..end] == label || (image && &control[start..end] == "□"))
                     .then_some((bounds.0, bounds.1, start, end))
             };
             let candidate = exact.and_then(matches_label).or_else(|| {

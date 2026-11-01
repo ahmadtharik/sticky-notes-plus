@@ -56,7 +56,9 @@ pub struct NativeDocument {
     pub chip_ids: Vec<String>,
 }
 
-#[repr(C)]
+type Handler<F> = RefCell<Option<Box<F>>>;
+type ImageLoader = dyn Fn(&str) -> Result<Vec<u8>, String>;
+
 /// Presentation-only formatting laid over checklist lines; removed before the
 /// document is read back so it never reaches saved styles.
 #[derive(Clone, Copy)]
@@ -65,6 +67,7 @@ enum TaskStyle {
     Marker,
 }
 
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct CharRange {
     cp_min: i32,
@@ -128,8 +131,8 @@ struct Inner {
     layout_bounds: Cell<Option<[f32; 4]>>,
     metrics: Cell<NativeMetrics>,
     history: RefCell<crate::editor_history::History<NativeDocument>>,
-    chip_clicked: RefCell<Option<Box<dyn FnMut(i32, f32, f32)>>>,
-    checklist_clicked: RefCell<Option<Box<dyn FnMut(i32, bool)>>>,
+    chip_clicked: Handler<dyn FnMut(i32, f32, f32)>,
+    checklist_clicked: Handler<dyn FnMut(i32, bool)>,
     mouse_down: Cell<Option<(i16, i16)>>,
     composing: Cell<bool>,
     handled_enter: Cell<bool>,
@@ -138,10 +141,10 @@ struct Inner {
     tracked_chips: RefCell<Vec<TrackedNativeChip>>,
     task_styles: RefCell<Vec<(ITextRange, TaskStyle)>>,
     last_edit_at: Cell<Option<usize>>,
-    image_loader: RefCell<Option<Box<dyn Fn(&str) -> Result<Vec<u8>, String>>>>,
+    image_loader: Handler<ImageLoader>,
     images: RefCell<HashMap<String, Vec<u8>>>,
     image_errors: RefCell<Vec<String>>,
-    image_paste: RefCell<Option<Box<dyn FnMut(Result<Vec<u8>, String>)>>>,
+    image_paste: Handler<dyn FnMut(Result<Vec<u8>, String>)>,
     focus_toolbar: RefCell<Option<Box<dyn FnMut()>>>,
 }
 
@@ -366,7 +369,7 @@ impl NativeRichEditor {
         };
         // Match the former editor's warm paper field instead of the default
         // pure white, while retaining system caret/selection accessibility.
-        unsafe { SendMessageW(hwnd, EM_SETBKGNDCOLOR, 0, 0x00f8_f8_f8) };
+        unsafe { SendMessageW(hwnd, EM_SETBKGNDCOLOR, 0, 0x00f8f8f8) };
         let inner = Rc::new(Inner {
             hwnd,
             original_proc: Cell::new(None),
@@ -415,6 +418,7 @@ impl NativeRichEditor {
             unsafe { DestroyWindow(hwnd) };
             return Err("Windows could not subclass the RichEdit child".into());
         }
+        #[allow(clippy::missing_transmute_annotations)]
         inner
             .original_proc
             .set(unsafe { std::mem::transmute(previous) });
@@ -495,6 +499,7 @@ impl NativeRichEditor {
         self.inner.emit_change();
     }
 
+    #[cfg(feature = "dev-tools")]
     pub fn take_probe_metrics(&self) -> NativeMetrics {
         self.inner.metrics.replace(NativeMetrics::default())
     }
@@ -563,6 +568,7 @@ impl NativeRichEditor {
 
     /// Synthetic input is only used by the explicit isolated acceptance probe.
     /// It travels through the real child procedure and normal autosave callback.
+    #[cfg(feature = "dev-tools")]
     pub(crate) fn inject_probe_character(&self, character: char) {
         let started = Instant::now();
         assert!(character.is_ascii(), "probe input must be one UTF-16 unit");
@@ -662,7 +668,7 @@ impl NativeRichEditor {
             .inner
             .layout_bounds
             .get()
-            .map_or(true, |previous| previous[2] != bounds[2]);
+            .is_none_or(|previous| previous[2] != bounds[2]);
         let restore = if width_changed && !self.inner.images.borrow().is_empty() {
             self.flush_pending_change();
             Some(unsafe {
@@ -1084,6 +1090,9 @@ unsafe extern "system" fn rich_edit_proc(
         }
     }
     let result = unsafe { CallWindowProcW(original, hwnd, message, wparam, lparam) };
+    if message == windows_sys::Win32::UI::WindowsAndMessaging::WM_PAINT {
+        draw_empty_hint(hwnd, &*pointer);
+    }
     if message == WM_LBUTTONUP {
         let projection = control_projection(hwnd);
         let point = selection(hwnd).cp_min.max(0) as usize;
@@ -1460,6 +1469,52 @@ unsafe fn apply_palette(hwnd: HWND, rgb: u32) {
     let _ = document_from_control(hwnd);
 }
 
+/// RichEdit has no placeholder of its own, so this paints one over an empty note.
+unsafe fn draw_empty_hint(hwnd: HWND, inner: &Inner) {
+    use windows_sys::Win32::{
+        Foundation::RECT,
+        Graphics::Gdi::{
+            CreateFontW, DeleteObject, GetDC, ReleaseDC, SelectObject, SetBkMode, SetTextColor,
+            TextOutW, TRANSPARENT,
+        },
+        UI::WindowsAndMessaging::GetWindowTextLengthW,
+    };
+    const EM_GETRECT: u32 = 0x00B2;
+    if GetWindowTextLengthW(hwnd) != 0 {
+        return;
+    }
+    let mut area = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    SendMessageW(hwnd, EM_GETRECT, 0, (&mut area as *mut RECT) as LPARAM);
+    let dc = GetDC(hwnd);
+    if dc.is_null() {
+        return;
+    }
+    let face: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
+    let height = -(14.0 * inner.scale_factor.get()).round() as i32;
+    let font = CreateFontW(height, 0, 0, 0, 400, 0, 0, 0, 0, 0, 0, 0, 0, face.as_ptr());
+    let previous = SelectObject(dc, font);
+    SetBkMode(dc, TRANSPARENT as i32);
+    // COLORREF is 0x00BBGGRR.
+    SetTextColor(
+        dc,
+        if matches!(inner.palette.get(), Some(0x454545 | 0x6f7078)) {
+            0x00c8c8c8
+        } else {
+            0x00707070
+        },
+    );
+    let hint: Vec<u16> = "Write a note…".encode_utf16().collect();
+    TextOutW(dc, area.left, area.top, hint.as_ptr(), hint.len() as i32);
+    SelectObject(dc, previous);
+    DeleteObject(font);
+    ReleaseDC(hwnd, dc);
+}
+
 /// True when the mouse is over a checklist square, so it shows a hand cursor.
 unsafe fn pointer_over_checkbox(hwnd: HWND) -> bool {
     use windows_sys::Win32::{Foundation::POINT, Graphics::Gdi::ScreenToClient};
@@ -1554,8 +1609,7 @@ unsafe fn control_projection(hwnd: HWND) -> crate::native_projection::Projection
         editors
             .borrow()
             .get(&(hwnd as isize))
-            .map(|pointer| (*(*pointer)).last_edit_at.get())
-            .flatten()
+            .and_then(|pointer| (*(*pointer)).last_edit_at.get())
     });
     let projection = crate::native_projection::Projection::from_visible_control_with_edit(
         &raw, &tracked, edit_at,

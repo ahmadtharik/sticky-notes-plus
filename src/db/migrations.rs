@@ -4,6 +4,33 @@ pub const CURRENT: i64 = 6;
 
 const INITIAL: &str = include_str!("../../schema/001_initial.sql");
 
+/// Snapshots a database that holds notes before its schema changes. A failed
+/// snapshot stops the upgrade, leaving the data as it was.
+fn backup_before_upgrade(conn: &Connection) -> rusqlite::Result<()> {
+    let Some(database) = conn.path().filter(|path| !path.is_empty()) else {
+        return Ok(());
+    };
+    let has_notes: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='notes')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_notes {
+        return Ok(());
+    }
+    let database = std::path::Path::new(database);
+    let backup = database.with_file_name(format!("before-schema-{CURRENT}.db"));
+    let partial = backup.with_extension("partial");
+    let io_error = |error| rusqlite::Error::ToSqlConversionFailure(Box::new(error));
+    match std::fs::remove_file(&partial) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(io_error(error)),
+        _ => (),
+    }
+    // VACUUM INTO creates a consistent snapshot, including committed WAL.
+    conn.execute("VACUUM INTO ?1", [partial.to_string_lossy().as_ref()])?;
+    std::fs::rename(&partial, &backup).map_err(io_error)
+}
+
 pub fn apply(conn: &Connection) -> rusqlite::Result<i64> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
@@ -19,9 +46,15 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<i64> {
         )
         .unwrap_or(0);
     if applied > CURRENT {
-        return Err(rusqlite::Error::InvalidParameterName(format!(
-            "db schema version {applied} is newer than this app supports ({CURRENT})"
-        )));
+        return Err(rusqlite::Error::ToSqlConversionFailure(
+            format!(
+                "They were saved by a newer version of the app (data version {applied}, this app supports {CURRENT}). Install the latest version."
+            )
+            .into(),
+        ));
+    }
+    if applied < CURRENT {
+        backup_before_upgrade(conn)?;
     }
     let tx = conn.unchecked_transaction()?;
 
@@ -147,6 +180,75 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap()
+    }
+
+    #[test]
+    fn upgrading_a_database_first_saves_a_readable_backup() {
+        let directory =
+            std::env::temp_dir().join(format!("sticky-upgrade-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("sticky-notes.db");
+        let backup = directory.join(format!("before-schema-{CURRENT}.db"));
+        let conn = Connection::open(&path).unwrap();
+
+        // A new database has nothing to protect.
+        apply(&conn).unwrap();
+        assert!(!backup.exists());
+
+        // Nor does opening one already on the current schema.
+        conn.execute(
+            "INSERT INTO notes(id,content,created_at,modified_at) VALUES ('kept','','t','t')",
+            [],
+        )
+        .unwrap();
+        apply(&conn).unwrap();
+        assert!(!backup.exists());
+
+        conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])
+            .unwrap();
+        assert_eq!(apply(&conn).unwrap(), CURRENT);
+        let saved = Connection::open(&backup).unwrap();
+        let version: String = saved
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "5");
+        let kept: i64 = saved
+            .query_row("SELECT count(*) FROM notes WHERE id='kept'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, 1);
+        drop((conn, saved));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_failed_backup_stops_the_upgrade() {
+        let directory =
+            std::env::temp_dir().join(format!("sticky-upgrade-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let conn = Connection::open(directory.join("sticky-notes.db")).unwrap();
+        apply(&conn).unwrap();
+        conn.execute("UPDATE meta SET value='5' WHERE key='schema_version'", [])
+            .unwrap();
+        // A folder in the way makes the final rename fail.
+        std::fs::create_dir(directory.join(format!("before-schema-{CURRENT}.db"))).unwrap();
+
+        assert!(apply(&conn).is_err());
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "5");
+        drop(conn);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -1,17 +1,27 @@
-node_modules
-dist
-src-tauri/target
 *.local
-spikes/*/target
+
+# Your own note exports.
+/Sticky Notes *.json
+/Sticky Notes *-images/
 
 # Local planning, spike notes, and generated acceptance evidence.
 /DESIGN-UI.md
 /docs/
-/slint-app/*.md
-/slint-app/docs/
 
 # Machine-local configuration and diagnostic output.
 .env
 .env.*
 !.env.example
 *.log
+
+# Rust build output, including alternate release-validation targets.
+/target/
+/target-*/
+
+# Local SQLite data and transient write-ahead-log files.
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+/HANDOFF.md

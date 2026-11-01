@@ -1,0 +1,50 @@
+name: Release
+
+# Pushing a tag such as v0.2.0 builds the installer and publishes a release.
+# The tag must match the version in Cargo.toml.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      STICKY_NOTES_GOOGLE_CLIENT_ID: ${{ secrets.STICKY_NOTES_GOOGLE_CLIENT_ID }}
+      STICKY_NOTES_GOOGLE_CLIENT_SECRET: ${{ secrets.STICKY_NOTES_GOOGLE_CLIENT_SECRET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the tag and secrets
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:GITHUB_REF_NAME) { throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version $version" }
+          if (-not $env:STICKY_NOTES_GOOGLE_CLIENT_ID -or -not $env:STICKY_NOTES_GOOGLE_CLIENT_SECRET) { throw 'Google client secrets are not set' }
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 6.0.x
+
+      - name: Install WiX
+        run: dotnet tool install --global wix --version 4.0.6
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build the installer
+        run: .\packaging\build.ps1
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Set-Location target\installer
+          $hash = (Get-FileHash StickyNotesPlus.msi -Algorithm SHA256).Hash.ToLower()
+          "$hash  StickyNotesPlus.msi" | Out-File StickyNotesPlus.msi.sha256 -Encoding ascii
+          gh release create $env:GITHUB_REF_NAME StickyNotesPlus.msi StickyNotesPlus.msi.sha256 --generate-notes

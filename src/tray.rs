@@ -35,13 +35,10 @@ mod platform {
             let create_note = MenuItem::with_id(CREATE_NOTE, "New sticky", true, None);
             let quit = MenuItem::with_id(QUIT, "Quit", true, None);
             let menu = Menu::with_items(&[&show_board, &create_note, &quit])?;
-            let icon = Icon::from_rgba(
-                vec![
-                    255, 229, 112, 255, 255, 229, 112, 255, 255, 229, 112, 255, 255, 229, 112, 255,
-                ],
-                2,
-                2,
-            )?;
+            let picture =
+                image::load_from_memory(include_bytes!("../ui/icons/tray-icon.png"))?.into_rgba8();
+            let (width, height) = picture.dimensions();
+            let icon = Icon::from_rgba(picture.into_raw(), width, height)?;
             let icon = TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
                 .with_tooltip("Sticky Notes+")

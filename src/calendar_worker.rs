@@ -207,7 +207,7 @@ fn run(db: Arc<Mutex<Db>>, receiver: Receiver<Command>, on_status: impl Fn(SyncS
 }
 
 fn connected(db: &Mutex<Db>) -> Option<(CalendarConfig, String)> {
-    let guard = db.lock().ok()?;
+    let guard = crate::db::lock(db);
     let config = calendar_sync::load_config(&guard.conn).ok()??;
     let token = google_calendar::load_refresh_token(&guard.conn).ok()??;
     Some((config, token))
@@ -260,7 +260,7 @@ fn has_work(
     zone: &str,
     now: chrono::NaiveDateTime,
 ) -> bool {
-    let Ok(guard) = db.lock() else { return false };
+    let guard = crate::db::lock(db);
     let (Ok(desired), Ok(pushed)) = (
         calendar_sync::desired_events(&guard.conn, config, zone, now),
         calendar_sync::pushed_events(&guard.conn),
@@ -338,10 +338,7 @@ fn connect(
     // Reconnecting after access ended keeps the existing calendar and what
     // was already pushed; only a first connect creates the calendar.
     let existing = {
-        let guard = state
-            .db
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Database lock unavailable"))?;
+        let guard = crate::db::lock(&state.db);
         calendar_sync::load_config(&guard.conn).ok().flatten()
     };
     let config = match existing {
@@ -358,10 +355,7 @@ fn connect(
             }
         }
     };
-    let guard = state
-        .db
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Database lock unavailable"))?;
+    let guard = crate::db::lock(&state.db);
     let transaction = guard.conn.unchecked_transaction()?;
     calendar_sync::save_config(&transaction, &config)?;
     google_calendar::save_refresh_token(&transaction, &refresh_token)?;
@@ -388,10 +382,7 @@ fn disconnect(
         }
         let _ = api.revoke();
     }
-    let guard = state
-        .db
-        .lock()
-        .map_err(|_| anyhow::anyhow!("Database lock unavailable"))?;
+    let guard = crate::db::lock(&state.db);
     let transaction = guard.conn.unchecked_transaction()?;
     calendar_sync::clear(&transaction)?;
     google_calendar::forget_refresh_token(&transaction)?;
@@ -418,10 +409,10 @@ pub fn update_options(
     calendar_sync::save_config(&guard.conn, &config)
 }
 
-struct Apartment(bool);
+pub(crate) struct Apartment(bool);
 
 impl Apartment {
-    fn multithreaded() -> Self {
+    pub(crate) fn multithreaded() -> Self {
         use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
         Self(unsafe { RoInitialize(RO_INIT_MULTITHREADED) }.is_ok())
     }

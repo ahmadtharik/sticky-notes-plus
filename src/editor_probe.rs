@@ -1,4 +1,5 @@
 //! Explicit, isolated release probe. Never opens the production database.
+#![allow(clippy::field_reassign_with_default)]
 use crate::*;
 use std::{cell::Cell, fs::OpenOptions, io::Write, mem::size_of, time::Instant};
 use windows_sys::Win32::{
@@ -120,7 +121,7 @@ pub fn window_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     1 => {
                         let window = windows.borrow()[0].window.clone_strong();
-                        geometry.set(Some(WindowGeometry::from_window(&window.window())));
+                        geometry.set(Some(WindowGeometry::from_window(window.window())));
                         if cycles.get() == 0 {
                             db.lock().unwrap().conn.execute_batch("CREATE TRIGGER reject_return_content BEFORE UPDATE OF content ON notes BEGIN SELECT RAISE(ABORT, 'acceptance save failure'); END;")?;
                             window.invoke_return_to_board();
@@ -189,7 +190,7 @@ pub fn window_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
                             entry.window.get_editor_text().as_str() == format!("{source}."),
                             "Reopen lost saved input"
                         );
-                        let realized = WindowGeometry::from_window(&entry.window.window());
+                        let realized = WindowGeometry::from_window(entry.window.window());
                         let before = geometry.get().unwrap();
                         anyhow::ensure!(
                             realized.x == 80
@@ -407,9 +408,9 @@ pub fn preview() -> Result<(), Box<dyn std::error::Error>> {
                         entry.window.get_editor_height(),
                     ]);
                 }
-                let geometry = WindowGeometry::from_window(&entry.window.window());
-                if geometry != entry.last_geometry {
-                    if notes::save_window_geom(
+                let geometry = WindowGeometry::from_window(entry.window.window());
+                if geometry != entry.last_geometry
+                    && notes::save_window_geom(
                         &guard.conn,
                         &entry.id,
                         f64::from(geometry.x),
@@ -419,9 +420,8 @@ pub fn preview() -> Result<(), Box<dyn std::error::Error>> {
                         true,
                     )
                     .is_ok()
-                    {
-                        entry.last_geometry = geometry;
-                    }
+                {
+                    entry.last_geometry = geometry;
                 }
             }
         });

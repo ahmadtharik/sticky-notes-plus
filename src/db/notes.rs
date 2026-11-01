@@ -143,6 +143,7 @@ pub fn get(conn: &Connection, id: &str) -> rusqlite::Result<Option<NoteRow>> {
     rows.next().transpose()
 }
 
+#[cfg(test)]
 pub fn update_content(conn: &Connection, id: &str, content: &str) -> rusqlite::Result<()> {
     save_content_and_color(conn, id, content, None)
 }
@@ -187,6 +188,18 @@ pub fn save_content_in_transaction(
     }
     let content = crate::content_identity::reconcile_identities(&previous.content, content)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    // Opening an empty note re-saves it. That isn't an edit, so it mustn't count
+    // as one when the note is later closed still empty.
+    let still_empty = content_to_plain(&previous.content).trim().is_empty()
+        && content_to_plain(&content).trim().is_empty()
+        && color.is_none_or(|color| color == previous.color)
+        && crate::inline_images::content_ids(&content).is_empty()
+        && reminders::extract_date_chips(&content).is_empty();
+    let modified_at = if still_empty {
+        previous.modified_at
+    } else {
+        now()
+    };
     let n = conn.execute(
         "UPDATE notes SET content=?2,title=?3,color=coalesce(?4,color),modified_at=?5 WHERE id=?1 AND deleted_at IS NULL",
         params![
@@ -194,7 +207,7 @@ pub fn save_content_in_transaction(
             content,
             title_from_plain(&content_to_plain(&content)),
             color,
-            now()
+            modified_at
         ],
     )?;
     if n == 0 {
@@ -252,6 +265,67 @@ fn transition_delete(conn: &Connection, id: &str, delete: bool) -> rusqlite::Res
         Ok(())
     }
 }
+/// Tidies a note closed with nothing in it. One that was never edited simply
+/// goes away; one the user cleared moves to Deleted so it can be recovered.
+pub fn discard_if_blank(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
+    let Some(note) = get(conn, id)? else {
+        return Ok(false);
+    };
+    if note.deleted_at.is_some() {
+        return Ok(false);
+    }
+    let has_images: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM attachments WHERE note_id=?1)",
+        [id],
+        |r| r.get(0),
+    )?;
+    // Content this app didn't write is never treated as blank.
+    let plain = serde_json::from_str::<serde_json::Value>(&note.content)
+        .ok()
+        .and_then(|value| value.get("plain")?.as_str().map(str::to_owned));
+    let blank = plain.is_some_and(|plain| plain.trim().is_empty())
+        && note.title.unwrap_or_default().trim().is_empty()
+        && !has_images
+        && reminders::extract_date_chips(&note.content).is_empty();
+    if !blank {
+        return Ok(false);
+    }
+    soft_delete(conn, id)?;
+    if note.modified_at == note.created_at {
+        purge(conn, id)?;
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn insert_restored(
+    conn: &Connection,
+    id: &str,
+    content: &str,
+    color: &str,
+    pinned: bool,
+    archived: bool,
+    deleted_at: Option<&str>,
+    created_at: &str,
+    modified_at: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO notes(id,title,content,color,is_pinned,is_archived,deleted_at,created_at,modified_at,is_floating) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,0)",
+        params![
+            id,
+            title_from_plain(&content_to_plain(content)),
+            content,
+            color,
+            pinned,
+            archived,
+            deleted_at,
+            created_at,
+            modified_at,
+        ],
+    )?;
+    sync_note_fts(conn, id)
+}
+
 pub fn purge(conn: &Connection, id: &str) -> rusqlite::Result<()> {
     // Permanent deletion is deliberately only legal from the Deleted view.
     // This prevents an accidental direct call from bypassing the soft-delete
@@ -372,6 +446,59 @@ mod tests {
         let note = get(&d.conn, "n1").unwrap().unwrap();
         assert_eq!(note.window, Some((-120.0, 240.0, 420.0, 520.0)));
         assert!(note.is_floating);
+    }
+
+    #[test]
+    fn only_notes_with_nothing_in_them_are_discarded() {
+        let db = crate::db::Db::open_in_dir(
+            &std::env::temp_dir().join(format!("sticky-blank-{}", uuid::Uuid::new_v4())),
+        )
+        .unwrap();
+        let conn = &db.conn;
+        let empty = r#"{"blocks":[],"plain":"  "}"#;
+        create(conn, "blank", empty, "#FFF9B1").unwrap();
+        create(conn, "text", r#"{"blocks":[],"plain":"hi"}"#, "#FFF9B1").unwrap();
+        create(
+            conn,
+            "dated",
+            r#"{"blocks":[{"type":"text","runs":[{"type":"dateChip","attrs":{"chipId":"c","date":"2030-01-01"}}]}],"plain":""}"#,
+            "#FFF9B1",
+        )
+        .unwrap();
+        create(conn, "picture", empty, "#FFF9B1").unwrap();
+        conn.execute(
+            "INSERT INTO attachments(id,note_id,name,mime,bytes,width,height) VALUES ('a','picture','a','image/png',1,1,1)",
+            [],
+        )
+        .unwrap();
+        create(conn, "foreign", r#"{"blocks":[]}"#, "#FFF9B1").unwrap();
+        create(
+            conn,
+            "cleared",
+            r#"{"blocks":[],"plain":"was here"}"#,
+            "#FFF9B1",
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE notes SET modified_at='later' WHERE id='cleared'",
+            [],
+        )
+        .unwrap();
+        save_content_and_color(conn, "cleared", empty, None).unwrap();
+
+        // Opening an empty note re-saves it; that alone isn't an edit.
+        save_content_and_color(conn, "blank", empty, Some("#FFF9B1")).unwrap();
+        assert!(discard_if_blank(conn, "blank").unwrap());
+        for kept in ["text", "dated", "picture", "foreign"] {
+            assert!(!discard_if_blank(conn, kept).unwrap(), "{kept}");
+        }
+        assert!(!discard_if_blank(conn, "missing").unwrap());
+        assert!(discard_if_blank(conn, "cleared").unwrap());
+        assert_eq!(list(conn, true, false, None).unwrap().len(), 4);
+        let deleted = list(conn, true, true, None).unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].id, "cleared");
+        assert!(get(conn, "blank").unwrap().is_none());
     }
 
     #[test]
