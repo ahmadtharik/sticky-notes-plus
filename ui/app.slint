@@ -400,7 +400,8 @@ export component BoardWindow inherits Window {
             Button { text: "Dismiss"; clicked => { root.reminder-error = ""; } }
         }
         if root.reminder-panel-open && !root.settings-open && root.board-view == "notes" && due-reminders.length > 0: Rectangle {
-            height: min(150px, root.height * 0.35);
+            // The board's 440px minimum height always leaves room for this.
+            height: 150px;
             background: root.dark-theme ? #3a3322 : #fff7d6;
             border-width: 1px;
             border-color: root.dark-theme ? #8a7434 : #d8bc63;
@@ -953,7 +954,7 @@ export component NoteWindow inherits Window {
         }
         // Conditional creation removes this preview's layout constraints too;
         // merely hiding it still reserves its height in the vertical layout.
-        if !root.native-editor-active && !root.inline-image-mode && checklist-items.length > 0 && root.content-height >= 330px: Rectangle {
+        if !root.native-editor-active && !root.inline-image-mode && checklist-items.length > 0: Rectangle {
             background: root.note-color-value == "#6F7078" ? #00000025 : #ffffff75;
             border-width: 1px;
             border-color: #00000018;
@@ -973,7 +974,7 @@ export component NoteWindow inherits Window {
             }
         }
         if root.attachment-count > 0 && !root.native-editor-active: Rectangle {
-            height: min(110px, max(36px, root.content-height / 4));
+            height: 72px;
             background: #ffffff55;
             border-radius: 6px;
             HorizontalLayout {
@@ -1027,8 +1028,8 @@ export component NoteWindow inherits Window {
                 NoteAction { tip(text) => { root.toolbar-tip(text); } keyboard-editor-navigation: root.native-editor-active; focus-editor => { root.focus-native-editor(); } action-enabled: !root.inline-image-mode || root.native-editor-active; foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/calendar.svg"); label: "Date picker"; width: 32px; clicked => { root.toggle-date-panel(); } }
                 Rectangle { horizontal-stretch: 1; }
                 // Only where they fit beside the other tools at narrow widths.
-                if root.native-editor-active && root.width >= 324px: NoteAction { tip(text) => { root.toolbar-tip(text); } keyboard-editor-navigation: true; focus-editor => { root.focus-native-editor(); } foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/undo.svg"); label: "Undo"; width: 32px; clicked => { root.editor-history-action(false); } }
-                if root.native-editor-active && root.width >= 324px: NoteAction { tip(text) => { root.toolbar-tip(text); } keyboard-editor-navigation: true; focus-editor => { root.focus-native-editor(); } foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/redo.svg"); label: "Redo"; width: 32px; clicked => { root.editor-history-action(true); } }
+                if root.native-editor-active && root.native-client-width >= 324: NoteAction { tip(text) => { root.toolbar-tip(text); } keyboard-editor-navigation: true; focus-editor => { root.focus-native-editor(); } foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/undo.svg"); label: "Undo"; width: 32px; clicked => { root.editor-history-action(false); } }
+                if root.native-editor-active && root.native-client-width >= 324: NoteAction { tip(text) => { root.toolbar-tip(text); } keyboard-editor-navigation: true; focus-editor => { root.focus-native-editor(); } foreground: root.note-foreground; has-icon: true; icon: @image-url("icons/redo.svg"); label: "Redo"; width: 32px; clicked => { root.editor-history-action(true); } }
             }
             if root.save-error: HorizontalLayout {
                 height: 22px;
