@@ -1713,9 +1713,16 @@ fn notes_dates(content: &str) -> String {
         .join(" · ")
 }
 
+/// Card text without the `[ ]`/`[x]` checklist markers, which the board font
+/// can't draw as boxes.
+fn without_checklist_marker(line: &str) -> &str {
+    checklist_marker(line).map_or(line, |(_, end)| &line[end..])
+}
+
 fn note_preview(plain: &str, title: Option<&str>) -> String {
     let mut lines = plain
         .lines()
+        .map(without_checklist_marker)
         .filter(|line| !line.trim().is_empty())
         .peekable();
     if lines.peek().is_some_and(|line| Some(line.trim()) == title) {
@@ -1743,6 +1750,7 @@ fn refresh(board: &BoardWindow, db: &Arc<Mutex<Db>>, query: &str) {
                 .title
                 .as_deref()
                 .map(|title| calendar_sync::without_date_labels(&note.content, title))
+                .map(|title| without_checklist_marker(&title).trim().to_owned())
                 .filter(|title| !title.is_empty());
             let mut preview = note_preview(&plain, title.as_deref());
             if preview.is_empty() {
@@ -4392,6 +4400,18 @@ mod editor_tests {
             "Longer heading\nBody"
         );
         assert_eq!(note_preview(&"😀".repeat(300), None).chars().count(), 240);
+    }
+
+    #[test]
+    fn board_preview_hides_checklist_markers() {
+        assert_eq!(
+            note_preview(
+                "[ ] Groceries\n  [ ] oat milk\n[x] bread\n[ ]\nPlain [x] text",
+                Some("Groceries")
+            ),
+            "oat milk\nbread\nPlain [x] text"
+        );
+        assert_eq!(without_checklist_marker("[x] done"), "done");
     }
 
     #[test]
