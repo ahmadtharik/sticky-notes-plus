@@ -18,6 +18,8 @@ SmartScreen warning. Later updates can be installed from **Settings > Updates**.
   dedicated "Sticky Notes" calendar
 - Dark mode, a global new-note shortcut and Start with Windows
 
+Website: https://ahmadtharik.github.io/sticky-notes-plus/
+
 Privacy policy: https://ahmadtharik.github.io/sticky-notes-plus/privacy.html
 
 ## Build from source
