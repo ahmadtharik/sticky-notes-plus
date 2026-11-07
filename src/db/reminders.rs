@@ -154,9 +154,20 @@ fn push_chips(
 ) {
     let mut lines = vec![String::new()];
     let mut chips = Vec::new();
+    // Where the current line's text after its latest chip begins, if any.
+    let mut after_chip: Option<usize> = None;
     for (run_index, run) in runs.iter().enumerate() {
         let fallback = format!("{prefix}-run-{run_index}");
         if let Some(chip) = unique_chip(chip_from_run(run, fallback), seen) {
+            let line = lines.last_mut().unwrap();
+            // "Swim [Mon] and [Wed]": a joining word between two dates is
+            // not part of what either reminder is about.
+            if let Some(start) = after_chip {
+                if is_joiner(&line[start..]) {
+                    line.truncate(start);
+                }
+            }
+            after_chip = Some(line.len());
             chips.push((chip, lines.len() - 1));
         } else if let Some(text) = run
             .get("t")
@@ -167,13 +178,24 @@ fn push_chips(
             if let Some(first) = parts.next() {
                 lines.last_mut().unwrap().push_str(first);
             }
-            lines.extend(parts.map(str::to_owned));
+            for part in parts {
+                lines.push(part.to_owned());
+                after_chip = None;
+            }
         }
     }
     for (chip, line) in chips {
         let text = lines[line].split_whitespace().collect::<Vec<_>>().join(" ");
         result.push((chip, text));
     }
+}
+
+fn is_joiner(text: &str) -> bool {
+    let text = text.trim().to_lowercase();
+    matches!(
+        text.as_str(),
+        "and" | "or" | "&" | "+" | "/" | "then" | "and then"
+    )
 }
 
 fn unique_chip(

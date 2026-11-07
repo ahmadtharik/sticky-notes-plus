@@ -84,14 +84,54 @@ fn reminders_are_named_after_their_own_line() {
         reminder_names("[[date:2026-04-30]]"),
         [named("Untitled note", None)]
     );
-    // Two dates on one line share that line's name.
+    // Two dates on one line share that line's name, without the word that
+    // only joined the dates.
+    let swim = [named("Swim", Some("Gym")), named("Swim", Some("Gym"))];
     assert_eq!(
         reminder_names("Gym\nSwim [[date:2026-11-10T07:00]] and [[date:2026-11-12T07:00]]"),
+        swim
+    );
+    assert_eq!(
+        reminder_names("Gym\nSwim [[date:2026-11-10T07:00]] or [[date:2026-11-12T07:00]]"),
+        swim
+    );
+    assert_eq!(
+        reminder_names("Gym\nSwim [[date:2026-11-10T07:00]] & [[date:2026-11-12T07:00]] laps"),
         [
-            named("Swim and", Some("Gym")),
-            named("Swim and", Some("Gym"))
+            named("Swim laps", Some("Gym")),
+            named("Swim laps", Some("Gym"))
         ]
     );
+    // Words with meaning between the dates stay.
+    assert_eq!(
+        reminder_names(
+            "Gym\nSwim Monday [[date:2026-11-10T07:00]] and Wednesday [[date:2026-11-12T07:00]]"
+        ),
+        [
+            named("Swim Monday and Wednesday", Some("Gym")),
+            named("Swim Monday and Wednesday", Some("Gym"))
+        ]
+    );
+}
+
+#[test]
+fn typing_a_box_after_a_bullet_makes_a_checklist_item() {
+    let typed = |source: &str| {
+        bullet_to_checklist(source, source.len()).map(|result| (result.source, result.caret))
+    };
+    // The `]` being typed completes the box.
+    assert_eq!(typed("Work\n- [ "), Some(("Work\n[ ]".to_owned(), 8)));
+    assert_eq!(typed("  - [x"), Some(("  [x]".to_owned(), 5)));
+    // Anywhere else, `]` is just text.
+    assert_eq!(typed("- Buy [ "), None);
+    assert_eq!(typed("[ "), None);
+    assert_eq!(typed("- ["), None);
+    // Text after the cursor is kept.
+    let source = "- [  Pay rent";
+    let result = bullet_to_checklist(source, 4).unwrap();
+    assert_eq!(result.source, "[ ] Pay rent");
+    assert_eq!(result.caret, 3);
+    assert!(checklist_marker(&result.source).is_some());
 }
 
 #[test]

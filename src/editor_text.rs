@@ -798,6 +798,37 @@ pub(crate) fn map_offset_after_replacements(
     (offset as isize + delta).max(0) as usize
 }
 
+/// Typing the `]` that completes `[ ]` or `[x]` right after a bullet's `- `
+/// turns the line into a checklist item. Enter continues a bullet, so without
+/// this the box would stay literal text inside the bullet.
+pub(crate) fn bullet_to_checklist(source: &str, cursor: usize) -> Option<ListCommandResult> {
+    let (line_start, _) = line_bounds_at(source, cursor)?;
+    let before = &source[line_start..cursor];
+    let leading = before.len() - before.trim_start().len();
+    let marker = &before[leading..];
+    if !matches!(marker, "- [ " | "- [x" | "- [X") {
+        return None;
+    }
+    let bullet = line_start + leading;
+    let replacements = vec![
+        TextReplacement {
+            start: bullet,
+            end: bullet + 2,
+            replacement: String::new(),
+        },
+        TextReplacement {
+            start: cursor,
+            end: cursor,
+            replacement: "]".to_owned(),
+        },
+    ];
+    Some(ListCommandResult {
+        source: apply_replacements(source, &replacements)?,
+        caret: cursor - 1,
+        replacements,
+    })
+}
+
 pub(crate) fn list_command(
     source: &str,
     command: &str,

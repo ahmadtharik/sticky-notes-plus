@@ -826,6 +826,45 @@ impl Drop for NativeRichEditor {
     }
 }
 
+/// Applies a list edit as one step: one undo entry, the caret placed after
+/// it, and a single change report.
+unsafe fn apply_list_edit(
+    hwnd: HWND,
+    inner: &Inner,
+    document: NativeDocument,
+    result: crate::ListCommandResult,
+) {
+    let mut formats = crate::FormatRanges {
+        bold: document.bold.clone(),
+        italic: document.italic.clone(),
+        underline: document.underline.clone(),
+        strike: document.strike.clone(),
+    };
+    crate::remap_formats_after_replacements(&document.text, &result.replacements, &mut formats);
+    let next = NativeDocument {
+        text: result.source,
+        bold: formats.bold,
+        italic: formats.italic,
+        underline: formats.underline,
+        strike: formats.strike,
+        chip_ids: document.chip_ids.clone(),
+    };
+    inner.history.borrow_mut().record(document);
+    inner.history.borrow_mut().record(next.clone());
+    inner.suppress_change.set(true);
+    set_document(hwnd, &next);
+    let caret = control_projection(hwnd).to_control(result.caret) as i32;
+    set_selection(
+        hwnd,
+        CharRange {
+            cp_min: caret,
+            cp_max: caret,
+        },
+    );
+    inner.suppress_change.set(false);
+    inner.schedule_change();
+}
+
 unsafe extern "system" fn rich_edit_proc(
     hwnd: HWND,
     message: u32,
@@ -990,40 +1029,19 @@ unsafe extern "system" fn rich_edit_proc(
             // RichEdit can process Return during key-down, before WM_CHAR.
             // Handle the physical key once and swallow its translated char.
             inner.handled_enter.set(message == WM_KEYDOWN);
-            let mut formats = crate::FormatRanges {
-                bold: document.bold.clone(),
-                italic: document.italic.clone(),
-                underline: document.underline.clone(),
-                strike: document.strike.clone(),
-            };
-            crate::remap_formats_after_replacements(
-                &document.text,
-                &result.replacements,
-                &mut formats,
-            );
-            let next = NativeDocument {
-                text: result.source,
-                bold: formats.bold,
-                italic: formats.italic,
-                underline: formats.underline,
-                strike: formats.strike,
-                chip_ids: document.chip_ids.clone(),
-            };
-            inner.history.borrow_mut().record(document);
-            inner.history.borrow_mut().record(next.clone());
-            inner.suppress_change.set(true);
-            set_document(hwnd, &next);
-            let caret = control_projection(hwnd).to_control(result.caret) as i32;
-            set_selection(
-                hwnd,
-                CharRange {
-                    cp_min: caret,
-                    cp_max: caret,
-                },
-            );
-            inner.suppress_change.set(false);
-            inner.schedule_change();
+            apply_list_edit(hwnd, inner, document, result);
             return 0;
+        }
+    }
+    if message == WM_CHAR && wparam == b']' as usize && !inner.composing.get() {
+        let range = selection(hwnd);
+        if range.cp_min == range.cp_max {
+            let document = document_from_control(hwnd);
+            let caret = control_projection(hwnd).to_source(range.cp_min.max(0) as usize);
+            if let Some(result) = crate::bullet_to_checklist(&document.text, caret) {
+                apply_list_edit(hwnd, inner, document, result);
+                return 0;
+            }
         }
     }
     use windows_sys::Win32::UI::{
