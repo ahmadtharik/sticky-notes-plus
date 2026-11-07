@@ -1008,6 +1008,9 @@ export component NoteWindow inherits Window {
         }
         Rectangle {
             height: root.save-error ? 62px : 40px;
+            // Shown and hidden with the header. Hidden, it keeps its space so
+            // the text doesn't reflow.
+            visible: root.show-header || root.save-error;
             background: #ffffff12;
             border-radius: 0px;
             // Divider along the top edge; without y Slint centres it over the icons.
@@ -1183,5 +1186,19 @@ export component NoteWindow inherits Window {
         }
             }
     }
+    }
+    // Toolbar and header controls reach the window edges and would reset the
+    // pointer to an arrow, hiding Winit's resize cursor. These strips sit on
+    // top and show it; the resize itself is still handled by Winit.
+    if root.frameless: Rectangle {
+        property <length> edge: root.resize-border-width;
+        TouchArea { x: 0; y: parent.edge; width: parent.edge; height: root.height - 2 * parent.edge; mouse-cursor: w-resize; }
+        TouchArea { x: root.width - parent.edge; y: parent.edge; width: parent.edge; height: root.height - 2 * parent.edge; mouse-cursor: e-resize; }
+        TouchArea { x: parent.edge; y: 0; width: root.width - 2 * parent.edge; height: parent.edge; mouse-cursor: n-resize; }
+        TouchArea { x: parent.edge; y: root.height - parent.edge; width: root.width - 2 * parent.edge; height: parent.edge; mouse-cursor: s-resize; }
+        TouchArea { x: 0; y: 0; width: parent.edge; height: parent.edge; mouse-cursor: nw-resize; }
+        TouchArea { x: root.width - parent.edge; y: 0; width: parent.edge; height: parent.edge; mouse-cursor: ne-resize; }
+        TouchArea { x: 0; y: root.height - parent.edge; width: parent.edge; height: parent.edge; mouse-cursor: sw-resize; }
+        TouchArea { x: root.width - parent.edge; y: root.height - parent.edge; width: parent.edge; height: parent.edge; mouse-cursor: se-resize; }
     }
 }
