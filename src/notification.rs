@@ -121,7 +121,8 @@ fn xml(value: &str) -> String {
         .collect()
 }
 
-pub fn toast_xml(row: &crate::db::reminders::ReminderRow, title: &str) -> String {
+/// `title` names the item; `detail`, its note or date, is the second line.
+pub fn toast_xml(row: &crate::db::reminders::ReminderRow, title: &str, detail: &str) -> String {
     let activation = |action| {
         Activation {
             action,
@@ -141,13 +142,17 @@ pub fn toast_xml(row: &crate::db::reminders::ReminderRow, title: &str) -> String
             xml(&activation(action))
         ));
     }
-    format!("<toast scenario=\"reminder\" activationType=\"protocol\" launch=\"{}\"><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual><actions>{actions}</actions></toast>", xml(&activation(Action::Open)), xml(if title.is_empty() { "Sticky Notes+" } else { title }), xml(&row.label))
+    format!("<toast scenario=\"reminder\" activationType=\"protocol\" launch=\"{}\"><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual><actions>{actions}</actions></toast>", xml(&activation(Action::Open)), xml(if title.is_empty() { "Sticky Notes+" } else { title }), xml(if detail.is_empty() { &row.label } else { detail }))
 }
 
 /// Installer-owned marker gates native delivery. Development/portable builds
 /// never manufacture an identity in the user's registry or Start menu.
 #[cfg(windows)]
-pub fn show(row: &crate::db::reminders::ReminderRow, title: &str) -> anyhow::Result<bool> {
+pub fn show(
+    row: &crate::db::reminders::ReminderRow,
+    title: &str,
+    detail: &str,
+) -> anyhow::Result<bool> {
     use anyhow::Context;
     use windows::{
         core::HSTRING,
@@ -187,7 +192,7 @@ pub fn show(row: &crate::db::reminders::ReminderRow, title: &str) -> anyhow::Res
         Err(error) => eprintln!("Windows notification setting unavailable: {error}"),
     }
     let document = XmlDocument::new()?;
-    document.LoadXml(&HSTRING::from(toast_xml(row, title)))?;
+    document.LoadXml(&HSTRING::from(toast_xml(row, title, detail)))?;
     let toast = ToastNotification::CreateToastNotification(&document)?;
     notifier
         .Show(&toast)
@@ -253,7 +258,7 @@ mod tests {
             created_at: String::new(),
             modified_at: String::new(),
         };
-        let payload = toast_xml(&row, "Note <title>");
+        let payload = toast_xml(&row, "Note <title>", "");
         assert_eq!(payload.matches("<action content=").count(), 3);
         assert_eq!(payload.matches("activationType=\"protocol\"").count(), 4);
         assert_eq!(payload.matches("2026-10-02T09:00").count(), 4);

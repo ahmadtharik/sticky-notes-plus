@@ -180,24 +180,16 @@ pub(crate) fn due_reminders_from_rows(
             continue;
         };
         if note.deleted_at.is_none() {
-            let source_date = if reminder.due_time.is_empty() {
-                reminder.due_date.clone()
-            } else {
-                format!("{}T{}", reminder.due_date, reminder.due_time)
-            };
-            let label = if reminder.label == date_label(&source_date) {
-                String::new()
-            } else {
-                reminder.label
-            };
+            let name = calendar_sync::reminder_name(
+                &note.content,
+                note.title.as_deref(),
+                &reminder.chip_id,
+            );
             due.push(DueReminder {
                 id: reminder.id,
-                // The due line already shows the date.
-                title: calendar_sync::without_date_labels(
-                    &note.content,
-                    &note.title.unwrap_or_default(),
-                ),
-                label,
+                title: name.title,
+                // Shown before the due date: which note the item is in.
+                label: name.note.unwrap_or_default(),
                 due_label: date_label(&if reminder.due_time.is_empty() {
                     reminder.scheduled_date
                 } else {
@@ -590,12 +582,20 @@ pub(crate) fn surface_unannounced_due(board: &BoardWindow, db: &Arc<Mutex<Db>>) 
             let mut delivered = false;
             #[cfg(windows)]
             {
-                let title = notes::get(&guard.conn, &row.note_id)
+                let name = notes::get(&guard.conn, &row.note_id)
                     .ok()
                     .flatten()
-                    .and_then(|note| note.title)
-                    .unwrap_or_default();
-                match notification::show(&row, &title) {
+                    .map(|note| {
+                        calendar_sync::reminder_name(
+                            &note.content,
+                            note.title.as_deref(),
+                            &row.chip_id,
+                        )
+                    });
+                let (title, detail) = name.map_or_else(Default::default, |name| {
+                    (name.title, name.note.unwrap_or_else(|| row.label.clone()))
+                });
+                match notification::show(&row, &title, &detail) {
                     Ok(shown) => delivered = shown,
                     Err(error) => eprintln!("Windows reminder delivery unavailable: {error:#}"),
                 }

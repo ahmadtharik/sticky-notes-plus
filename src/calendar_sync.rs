@@ -146,7 +146,7 @@ pub fn desired_events(
     now: NaiveDateTime,
 ) -> anyhow::Result<Vec<EventSpec>> {
     let mut statement = conn.prepare(
-        "SELECT r.id,r.due_date,r.due_time,r.recurrence,r.created_at,n.title,n.content
+        "SELECT r.id,r.due_date,r.due_time,r.recurrence,r.created_at,n.title,n.content,r.chip_id
          FROM reminders r JOIN notes n ON n.id=r.note_id
          WHERE r.status='pending' AND r.due_time<>'' AND n.deleted_at IS NULL
          ORDER BY r.id",
@@ -160,12 +160,13 @@ pub fn desired_events(
             row.get::<_, String>(4)?,
             row.get::<_, Option<String>>(5)?,
             row.get::<_, String>(6)?,
+            row.get::<_, String>(7)?,
         ))
     })?;
     let connected_at = chrono::DateTime::parse_from_rfc3339(&config.connected_at)?;
     let mut events = Vec::new();
     for row in rows {
-        let (id, date, time, recurrence, created_at, title, content) = row?;
+        let (id, date, time, recurrence, created_at, title, content, chip_id) = row?;
         if !config.sync_existing
             && chrono::DateTime::parse_from_rfc3339(&created_at).is_ok_and(|at| at < connected_at)
         {
@@ -179,13 +180,11 @@ pub fn desired_events(
         };
         // The event already shows the time, so date-chip labels are dropped.
         let text = without_date_labels(&content, &crate::plain_from_content(&content));
-        let summary = text
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .map(|line| line.trim().chars().take(60).collect::<String>())
-            .or_else(|| title.map(|title| title.trim().to_owned()))
-            .filter(|title| !title.is_empty())
-            .unwrap_or_else(|| "Untitled note".into());
+        let summary = reminder_name(&content, title.as_deref(), &chip_id)
+            .title
+            .chars()
+            .take(60)
+            .collect();
         let description: String = if config.include_note_text {
             text.chars().take(2000).collect()
         } else {
@@ -204,6 +203,40 @@ pub fn desired_events(
         });
     }
     Ok(events)
+}
+
+/// What a reminder is called, and the note it belongs to when that differs.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ReminderName {
+    pub title: String,
+    pub note: Option<String>,
+}
+
+/// Names a reminder after the text on its date chip's line, so several dated
+/// items in one note stay distinguishable. A chip alone on its line, or one
+/// whose line can't be found, falls back to the note's first line.
+pub(crate) fn reminder_name(
+    content: &str,
+    note_title: Option<&str>,
+    chip_id: &str,
+) -> ReminderName {
+    // Separators left beside a removed chip ("Deadline: ", "Finish –").
+    let tidy = |text: &str| {
+        text.trim_matches(|c: char| c.is_whitespace() || "-–—:·,;|".contains(c))
+            .to_owned()
+    };
+    let note = without_date_labels(content, &crate::plain_from_content(content))
+        .lines()
+        .map(tidy)
+        .find(|line| !line.is_empty())
+        .or_else(|| note_title.map(tidy).filter(|title| !title.is_empty()));
+    let title = crate::db::reminders::chip_line(content, chip_id)
+        .map(|line| tidy(&line))
+        .filter(|line| !line.is_empty())
+        .or_else(|| note.clone())
+        .unwrap_or_else(|| "Untitled note".into());
+    let note = note.filter(|note| *note != title);
+    ReminderName { title, note }
 }
 
 /// The note text without its date-chip labels ("Dentist Oct 28 · 21:00" →

@@ -1,5 +1,99 @@
 use super::*;
 use crate::db::reminders;
+
+/// (title, note) for each date chip in a note written as `source`.
+fn reminder_names(source: &str) -> Vec<(String, Option<String>)> {
+    let content =
+        content_for_editor_with_checklists_and_formats(source, false, &FormatRanges::default());
+    reminders::extract_date_chips(&content)
+        .iter()
+        .map(|chip| {
+            let name = calendar_sync::reminder_name(&content, None, &chip.chip_id);
+            (name.title, name.note)
+        })
+        .collect()
+}
+
+#[test]
+fn reminders_are_named_from_content_saved_by_the_native_editor() {
+    // Saved by the RichEdit editor in a test profile.
+    let content = r#"{"blocks":[{"runs":[{"b":false,"t":"Dentist appointment"}],"type":"text"},{"runs":[{"b":false,"t":"Bring insurance card "},{"attrs":{"chipId":"9e750208-cd95-47e3-9e78-69490e769a70","date":"2026-11-12","label":"Nov 12 · 09:30","recurrence":"none","time":"09:30"},"type":"dateChip"}],"type":"text"}],"plain":"Dentist appointment\nBring insurance card Nov 12 · 09:30"}"#;
+    assert_eq!(
+        calendar_sync::reminder_name(
+            content,
+            Some("Dentist appointment"),
+            "9e750208-cd95-47e3-9e78-69490e769a70"
+        ),
+        calendar_sync::ReminderName {
+            title: "Bring insurance card".into(),
+            note: Some("Dentist appointment".into()),
+        }
+    );
+    // A reminder whose chip is gone falls back to the note.
+    assert_eq!(
+        calendar_sync::reminder_name(content, None, "removed").title,
+        "Dentist appointment"
+    );
+}
+
+#[test]
+fn reminders_are_named_after_their_own_line() {
+    let named = |title: &str, note: Option<&str>| (title.to_owned(), note.map(str::to_owned));
+    // One-line note: the line is the note, so no second line.
+    assert_eq!(
+        reminder_names("Dentist [[date:2026-11-12T09:30]]"),
+        [named("Dentist", None)]
+    );
+    // Dated bullets, checklist items and plain lines under a heading.
+    assert_eq!(
+        reminder_names(
+            "Work\n- Call Sam [[date:2026-11-12T09:30]]\n[ ] Pay rent [[date:2026-11-30]]\nSubmit report [[date:2026-11-14T17:00]]"
+        ),
+        [
+            named("Call Sam", Some("Work")),
+            named("Pay rent", Some("Work")),
+            named("Submit report", Some("Work")),
+        ]
+    );
+    // The chip first, in the middle, or after a separator.
+    assert_eq!(
+        reminder_names(
+            "Work\n- [[date:2026-11-15]] Finish terraform project\n- Send [[date:2026-11-16]] invoice to Alex\n- work on a terraform project - Finish by [[date:2026-11-15]]\n- Deadline: [[date:2026-11-20]]"
+        ),
+        [
+            named("Finish terraform project", Some("Work")),
+            named("Send invoice to Alex", Some("Work")),
+            named("work on a terraform project - Finish by", Some("Work")),
+            named("Deadline", Some("Work")),
+        ]
+    );
+    // A date on the heading line names the note's own reminder.
+    assert_eq!(
+        reminder_names("Lisbon trip [[date:2026-05-14]]\n- Book hotel [[date:2026-04-01]]"),
+        [
+            named("Lisbon trip", None),
+            named("Book hotel", Some("Lisbon trip")),
+        ]
+    );
+    // A date alone on its line, or a note that is only a date.
+    assert_eq!(
+        reminder_names("Tax return\n[[date:2026-04-30]]"),
+        [named("Tax return", None)]
+    );
+    assert_eq!(
+        reminder_names("[[date:2026-04-30]]"),
+        [named("Untitled note", None)]
+    );
+    // Two dates on one line share that line's name.
+    assert_eq!(
+        reminder_names("Gym\nSwim [[date:2026-11-10T07:00]] and [[date:2026-11-12T07:00]]"),
+        [
+            named("Swim and", Some("Gym")),
+            named("Swim and", Some("Gym"))
+        ]
+    );
+}
+
 #[test]
 fn typed_times_are_read_in_common_forms() {
     for (input, expected) in [

@@ -92,6 +92,23 @@ fn chip_from_run(run: &Value, fallback_id: String) -> Option<DateChipOccurrence>
 /// Explicit `attrs.chipId`/`attrs.id` values are preferred. Older or hand
 /// authored content without an id receives a deterministic location key.
 pub fn extract_date_chips(content: &str) -> Vec<DateChipOccurrence> {
+    chips_with_lines(content)
+        .into_iter()
+        .map(|(chip, _)| chip)
+        .collect()
+}
+
+/// The text on the line of the note where this date chip sits, without its
+/// date label, or `None` when the chip is gone or its line has no other text.
+pub fn chip_line(content: &str, chip_id: &str) -> Option<String> {
+    chips_with_lines(content)
+        .into_iter()
+        .find(|(chip, _)| chip.chip_id == chip_id)
+        .map(|(_, line)| line)
+        .filter(|line| !line.is_empty())
+}
+
+fn chips_with_lines(content: &str) -> Vec<(DateChipOccurrence, String)> {
     let Ok(value) = serde_json::from_str::<Value>(content) else {
         return Vec::new();
     };
@@ -102,12 +119,12 @@ pub fn extract_date_chips(content: &str) -> Vec<DateChipOccurrence> {
     let mut seen = HashSet::new();
     for (block_index, block) in blocks.iter().enumerate() {
         if let Some(runs) = block.get("runs").and_then(Value::as_array) {
-            for (run_index, run) in runs.iter().enumerate() {
-                let fallback = format!("block-{block_index}-run-{run_index}");
-                if let Some(chip) = unique_chip(chip_from_run(run, fallback), &mut seen) {
-                    result.push(chip);
-                }
-            }
+            push_chips(
+                runs,
+                &format!("block-{block_index}"),
+                &mut seen,
+                &mut result,
+            );
         }
         if let Some(items) = block.get("items").and_then(Value::as_array) {
             for (item_index, item) in items.iter().enumerate() {
@@ -117,18 +134,46 @@ pub fn extract_date_chips(content: &str) -> Vec<DateChipOccurrence> {
                     continue;
                 }
                 if let Some(runs) = item.get("runs").and_then(Value::as_array) {
-                    for (run_index, run) in runs.iter().enumerate() {
-                        let fallback =
-                            format!("block-{block_index}-item-{item_index}-run-{run_index}");
-                        if let Some(chip) = unique_chip(chip_from_run(run, fallback), &mut seen) {
-                            result.push(chip);
-                        }
-                    }
+                    let prefix = format!("block-{block_index}-item-{item_index}");
+                    push_chips(runs, &prefix, &mut seen, &mut result);
                 }
             }
         }
     }
     result
+}
+
+/// Adds the chips in one run list, each with the text of its own line. New
+/// content stores one line per block or item; older content may hold several
+/// lines in one run list, separated by newlines inside text runs.
+fn push_chips(
+    runs: &[Value],
+    prefix: &str,
+    seen: &mut HashSet<String>,
+    result: &mut Vec<(DateChipOccurrence, String)>,
+) {
+    let mut lines = vec![String::new()];
+    let mut chips = Vec::new();
+    for (run_index, run) in runs.iter().enumerate() {
+        let fallback = format!("{prefix}-run-{run_index}");
+        if let Some(chip) = unique_chip(chip_from_run(run, fallback), seen) {
+            chips.push((chip, lines.len() - 1));
+        } else if let Some(text) = run
+            .get("t")
+            .or_else(|| run.get("text"))
+            .and_then(Value::as_str)
+        {
+            let mut parts = text.split('\n');
+            if let Some(first) = parts.next() {
+                lines.last_mut().unwrap().push_str(first);
+            }
+            lines.extend(parts.map(str::to_owned));
+        }
+    }
+    for (chip, line) in chips {
+        let text = lines[line].split_whitespace().collect::<Vec<_>>().join(" ");
+        result.push((chip, text));
+    }
 }
 
 fn unique_chip(
