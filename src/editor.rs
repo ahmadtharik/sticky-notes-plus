@@ -1422,6 +1422,13 @@ pub(crate) fn open_editor(
                                 }
                             });
                         }
+                        i_slint_backend_winit::winit::event::WindowEvent::Focused(_) => {
+                            // Show or hide the header as soon as the note is
+                            // activated, rather than on the next 250 ms poll.
+                            if let Some(window) = frame_window.upgrade() {
+                                window_chrome::update_active(&window);
+                            }
+                        }
                         i_slint_backend_winit::winit::event::WindowEvent::Resized(_) => {
                             native_for_resize.layout();
                             if let Some(window) = frame_window.upgrade() {

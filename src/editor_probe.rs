@@ -396,7 +396,7 @@ pub fn preview() -> Result<(), Box<dyn std::error::Error>> {
             entries.retain(|entry| entry.window.window().is_visible());
             let guard = db.lock().unwrap();
             for entry in entries.iter_mut() {
-                window_chrome::update_hover(&entry.window);
+                window_chrome::update_active(&entry.window);
                 if let Some(native) = &entry.native_editor {
                     let [width, height] = native.client_size();
                     entry.window.set_native_client_width(width);

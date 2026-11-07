@@ -603,7 +603,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             for entry in windows.iter_mut() {
                 #[cfg(windows)]
-                window_chrome::update_hover(&entry.window);
+                window_chrome::update_active(&entry.window);
                 if let Some(native) = &entry.native_editor {
                     let [width, height] = native.client_size();
                     entry.window.set_native_client_width(width);

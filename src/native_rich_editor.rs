@@ -777,9 +777,9 @@ impl NativeRichEditor {
         let foreground =
             unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetForegroundWindow() };
         // The Slint canvas contains only note chrome around the native child.
-        // Thirty frames/second is ample for that chrome; RichEdit text input
-        // and caret painting bypass this filter entirely.
-        let interval = Duration::from_millis(if foreground == self.parent { 32 } else { 200 });
+        // The active note runs at 60 frames/second so its header slides in
+        // smoothly; RichEdit text input and caret painting bypass this filter.
+        let interval = Duration::from_millis(if foreground == self.parent { 16 } else { 200 });
         if let Some(last) = self.inner.last_frame.get() {
             let elapsed = last.elapsed();
             if elapsed < interval {

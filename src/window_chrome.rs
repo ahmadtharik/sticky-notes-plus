@@ -1,10 +1,10 @@
-//! Pointer state for Slint chrome surrounding a native child window.
+//! Pointer and activation state for Slint chrome around a native child window.
 //! Positions are physical desktop pixels, so dragging never mixes DPI units.
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use slint::{ComponentHandle, PhysicalPosition};
 use windows_sys::Win32::{
     Foundation::POINT,
-    UI::WindowsAndMessaging::{GetCursorPos, IsChild, WindowFromPoint},
+    UI::WindowsAndMessaging::{GetCursorPos, GetForegroundWindow},
 };
 
 pub fn cursor_position() -> Option<PhysicalPosition> {
@@ -12,7 +12,11 @@ pub fn cursor_position() -> Option<PhysicalPosition> {
     (unsafe { GetCursorPos(&mut point) } != 0).then_some(PhysicalPosition::new(point.x, point.y))
 }
 
-pub fn update_hover(window: &crate::NoteWindow) {
+/// Shows the note's header and toolbar while its window is the active one.
+/// Compared against the foreground window rather than keyboard focus, because
+/// the native editor child takes focus from the Slint window while the note
+/// stays active.
+pub fn update_active(window: &crate::NoteWindow) {
     let slint_handle = window.window().window_handle();
     let Ok(handle) = slint_handle.window_handle() else {
         return;
@@ -21,17 +25,9 @@ pub fn update_hover(window: &crate::NoteWindow) {
         return;
     };
     let parent = handle.hwnd.get() as windows_sys::Win32::Foundation::HWND;
-    let hovered = cursor_position().is_some_and(|position| {
-        let hit = unsafe {
-            WindowFromPoint(POINT {
-                x: position.x,
-                y: position.y,
-            })
-        };
-        hit == parent || unsafe { IsChild(parent, hit) } != 0
-    });
-    if window.get_pointer_inside() != hovered {
-        window.set_pointer_inside(hovered);
+    let active = unsafe { GetForegroundWindow() } == parent;
+    if window.get_note_active() != active {
+        window.set_note_active(active);
     }
 }
 
