@@ -38,9 +38,16 @@ building.
 
 ## Releasing
 
-Update `version` in `Cargo.toml`, commit, then push a matching tag such
-as `v0.2.0`. GitHub Actions builds the installer and publishes the release. It
-needs the two variables above as repository secrets.
+From a clean, up-to-date `main`, run:
+
+```powershell
+.\packaging\release.ps1 1.0.4 -Push
+```
+
+It bumps the version in `Cargo.toml` and `Cargo.lock`, runs the tests, commits,
+tags `v1.0.4` and pushes. GitHub Actions then builds the installer and
+publishes the release. Leave out `-Push` to review the commit before pushing.
+The build needs the two variables above as repository secrets.
 
 ## License
 
