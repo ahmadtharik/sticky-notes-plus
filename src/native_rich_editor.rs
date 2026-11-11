@@ -949,6 +949,8 @@ unsafe extern "system" fn rich_edit_proc(
     }
     // Remove presentation-only effects before RichEdit changes text or starts
     // an IME composition, so insertion never inherits a completed-task strike.
+    // Only styles touching the edit can be inherited; leaving the others in
+    // place keeps every other checkbox from shrinking until the next snapshot.
     if !inner.suppress_change.get()
         && matches!(
             message,
@@ -960,7 +962,7 @@ unsafe extern "system" fn rich_edit_proc(
                 | windows_sys::Win32::UI::WindowsAndMessaging::WM_IME_STARTCOMPOSITION
         )
     {
-        clear_task_styles(hwnd);
+        clear_task_styles_near(hwnd, selection(hwnd));
     }
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION,
@@ -1712,10 +1714,28 @@ unsafe fn document_from_control(hwnd: HWND) -> NativeDocument {
 /// Presentation ranges retain their actual user strike state. They are removed
 /// before snapshots/input and rebuilt afterwards, never serialized as styles.
 unsafe fn clear_task_styles(hwnd: HWND) {
+    clear_task_styles_where(hwnd, |_, _| true);
+}
+
+/// Removes only the presentation styles that overlap or border `edit`, which
+/// are the only ones typed or pasted text could inherit.
+unsafe fn clear_task_styles_near(hwnd: HWND, edit: CharRange) {
+    clear_task_styles_where(hwnd, |start, end| {
+        start <= edit.cp_max && end >= edit.cp_min
+    });
+}
+
+unsafe fn clear_task_styles_where(hwnd: HWND, remove: impl Fn(i32, i32) -> bool) {
     let pointer = EDITORS.with(|editors| editors.borrow().get(&(hwnd as isize)).copied());
     let Some(pointer) = pointer else { return };
     let inner = &*pointer;
-    let ranges = std::mem::take(&mut *inner.task_styles.borrow_mut());
+    let (ranges, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut *inner.task_styles.borrow_mut())
+        .into_iter()
+        .partition(|(range, _)| match (range.GetStart(), range.GetEnd()) {
+            (Ok(start), Ok(end)) => remove(start, end),
+            _ => true,
+        });
+    *inner.task_styles.borrow_mut() = kept;
     if ranges.is_empty() {
         return;
     }
