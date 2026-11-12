@@ -30,6 +30,8 @@ mod native_rich_editor;
 mod notification;
 #[cfg(all(windows, feature = "dev-tools"))]
 mod reliability_probe;
+#[cfg(windows)]
+mod session_end;
 mod settings;
 #[cfg(windows)]
 mod tooltip;
@@ -502,6 +504,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_updates(&board, &db, &editor_windows);
     #[cfg(windows)]
     setup_export(&board, &db, &editor_windows);
+    #[cfg(windows)]
+    {
+        // Sign-out and shutdown end the process without a Quit, so save what
+        // is still inside the autosave delay.
+        let db = db.clone();
+        let windows = editor_windows.clone();
+        let weak = board_weak.clone();
+        let watched = session_end::watch(move || {
+            if let Ok(windows) = windows.try_borrow() {
+                for entry in windows.iter() {
+                    flush_editor(&db, &entry.id, &entry.window, &entry.save_state, &weak);
+                }
+            }
+        });
+        if let Err(error) = watched {
+            eprintln!("Notes won't be saved on sign-out: {error:#}");
+        }
+    }
     refresh(&board, &db, "");
     // Evaluate immediately rather than making the user wait for the first
     // timer tick after launch.
