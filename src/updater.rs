@@ -179,7 +179,13 @@ pub fn apply(args: &[String]) -> anyhow::Result<()> {
         }
     }
     let folder = work_folder();
-    let status = std::process::Command::new("msiexec")
+    // By full path: a bare name is looked up in this helper's own temp folder
+    // first, where anything could have been placed.
+    let msiexec = std::env::var_os("SystemRoot")
+        .map(|root| PathBuf::from(root).join("System32").join("msiexec.exe"))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from("msiexec"));
+    let status = std::process::Command::new(msiexec)
         .args(["/i", msi, "/qn", "/norestart", "/l*v"])
         .arg(folder.join("install.log"))
         .status();

@@ -166,9 +166,15 @@ fn run(db: Arc<Mutex<Db>>, receiver: Receiver<Command>, on_status: impl Fn(SyncS
         SyncStatus::NotConnected
     };
     report(&mut state, initial);
+    // Commands that arrived during a sign-in, kept in order.
+    let mut queued = std::collections::VecDeque::new();
     loop {
         let mut forced = false;
-        match receiver.recv_timeout(CHECK_EVERY) {
+        let command = match queued.pop_front() {
+            Some(command) => Ok(command),
+            None => receiver.recv_timeout(CHECK_EVERY),
+        };
+        match command {
             Ok(Command::SyncNow) => {
                 forced = true;
                 state.backoff.succeeded();
@@ -186,6 +192,13 @@ fn run(db: Arc<Mutex<Db>>, receiver: Receiver<Command>, on_status: impl Fn(SyncS
                     Err(error) => SyncStatus::Error(error.to_string()),
                 };
                 report(&mut state, status);
+                // Connect clicks made while the browser sign-in was open would
+                // each start another sign-in; that one already finished.
+                while let Ok(command) = receiver.try_recv() {
+                    if !matches!(command, Command::Connect(_)) {
+                        queued.push_back(command);
+                    }
+                }
             }
             Ok(Command::Disconnect { delete_calendar }) => {
                 let status = match disconnect(&state, &transport, delete_calendar) {
@@ -345,9 +358,18 @@ fn connect(
         Some(config) => config,
         None => {
             let zone = google_calendar::local_time_zone().unwrap_or_else(|_| "UTC".into());
+            let api = CalendarApi::new(transport, client, refresh_token.clone());
+            let calendar_id = match api.create_calendar(&zone) {
+                Ok(id) => id,
+                Err(error) => {
+                    // Nothing was saved, so don't leave Google holding a grant
+                    // the app has already forgotten.
+                    let _ = api.revoke();
+                    return Err(error.into());
+                }
+            };
             CalendarConfig {
-                calendar_id: CalendarApi::new(transport, client, refresh_token.clone())
-                    .create_calendar(&zone)?,
+                calendar_id,
                 sync_existing: options.sync_existing,
                 connected_at: chrono::Utc::now().to_rfc3339(),
                 alert_minutes: options.alert_minutes,
@@ -380,7 +402,11 @@ fn disconnect(
                 ));
             }
         }
-        let _ = api.revoke();
+        if let Err(error) = api.revoke() {
+            problem.get_or_insert(format!(
+                "Disconnected here, but Google couldn't be told ({error}). Remove Sticky Notes Plus at myaccount.google.com/permissions."
+            ));
+        }
     }
     let guard = crate::db::lock(&state.db);
     let transaction = guard.conn.unchecked_transaction()?;

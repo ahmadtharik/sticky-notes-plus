@@ -86,8 +86,41 @@ pub fn list(conn: &Connection, note_id: &str) -> Result<Vec<Attachment>> {
 
 /// Call under the same database mutex as imports. Only UUID-named, unreferenced
 /// regular files directly inside application storage are eligible for deletion.
+/// Imports write image files before inserting their rows, on another thread.
+/// While one runs, those files look orphaned, so cleanup of that attachments
+/// folder waits for a later run.
+static IMPORTS_RUNNING: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Marks an import into `root` as running until dropped.
+pub(crate) struct ImportGuard(PathBuf);
+
+impl ImportGuard {
+    pub(crate) fn new(root: PathBuf) -> Self {
+        imports_running().push(root.clone());
+        ImportGuard(root)
+    }
+}
+
+impl Drop for ImportGuard {
+    fn drop(&mut self) {
+        let mut running = imports_running();
+        if let Some(index) = running.iter().position(|root| *root == self.0) {
+            running.remove(index);
+        }
+    }
+}
+
+fn imports_running() -> std::sync::MutexGuard<'static, Vec<PathBuf>> {
+    IMPORTS_RUNNING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 pub fn cleanup_orphans(conn: &Connection) -> Result<()> {
     let root = storage(conn)?;
+    if imports_running().contains(&root) {
+        return Ok(());
+    }
     for entry in std::fs::read_dir(&root)? {
         let entry = entry?;
         if !entry.file_type()?.is_file() {
@@ -543,5 +576,22 @@ mod tests {
             .exists());
         assert!(unrelated.exists());
         assert!(source.exists());
+    }
+
+    #[test]
+    fn cleanup_waits_while_an_import_writes_files() {
+        let directory =
+            std::env::temp_dir().join(format!("sticky-attachments-{}", uuid::Uuid::new_v4()));
+        let db = Db::open_in_dir(&directory).unwrap();
+        let root = storage(&db.conn).unwrap();
+        // An imported file whose row isn't inserted yet.
+        let pending = root.join(format!("{}.original", uuid::Uuid::new_v4()));
+        std::fs::write(&pending, "image").unwrap();
+        let import = ImportGuard::new(root);
+        cleanup_orphans(&db.conn).unwrap();
+        assert!(pending.exists());
+        drop(import);
+        cleanup_orphans(&db.conn).unwrap();
+        assert!(!pending.exists());
     }
 }

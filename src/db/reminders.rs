@@ -4,7 +4,7 @@
 //! small projection of that content: editing a note reconciles the projection
 //! while preserving a reminder's status when its stable chip identity remains.
 
-use chrono::{DateTime, Datelike, Local, Months, NaiveDate, NaiveTime, Utc};
+use chrono::{DateTime, Datelike, Local, Months, NaiveDate, NaiveDateTime, NaiveTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
 use serde_json::Value;
@@ -360,10 +360,71 @@ pub fn unannounced_due_at(
     conn: &Connection,
     as_of: DateTime<Local>,
 ) -> rusqlite::Result<Vec<ReminderRow>> {
+    roll_elapsed_repeats(conn, as_of)?;
     Ok(due_at(conn, as_of)?
         .into_iter()
         .filter(|row| row.notified_for.as_deref() != Some(occurrence_key(row).as_str()))
         .collect())
+}
+
+/// A repeat normally moves on when the user marks it done or dismisses it.
+/// One that was ignored (its notification timed out or was closed) would
+/// otherwise keep its old date and never notify again, so once a later
+/// occurrence has arrived it moves to the latest one and becomes announceable.
+/// Snoozed reminders keep their snooze.
+fn roll_elapsed_repeats(conn: &Connection, as_of: DateTime<Local>) -> rusqlite::Result<()> {
+    let mut stmt = conn.prepare(
+        "SELECT id,due_date,scheduled_date,due_time,recurrence FROM reminders
+         WHERE status='pending' AND recurrence<>'none' AND scheduled_date<?1
+         AND (snoozed_until IS NULL OR snoozed_until<=?2)",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![
+                as_of.format("%Y-%m-%d").to_string(),
+                as_of.with_timezone(&Utc).to_rfc3339()
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, anchor, current, due_time, cadence) in rows {
+        let (Ok(anchor), Ok(mut date)) = (
+            NaiveDate::parse_from_str(&anchor, "%Y-%m-%d"),
+            NaiveDate::parse_from_str(&current, "%Y-%m-%d"),
+        ) else {
+            continue;
+        };
+        let time = if due_time.is_empty() {
+            NaiveTime::MIN
+        } else {
+            match NaiveTime::parse_from_str(&due_time, "%H:%M") {
+                Ok(time) => time,
+                Err(_) => continue,
+            }
+        };
+        // Step to the latest occurrence that has already arrived.
+        while let Some(next) = next_recurrence(anchor, date, time, &cadence, date.and_time(time))
+            .filter(|next| next.and_time(time) <= as_of.naive_local())
+        {
+            date = next;
+        }
+        if date.format("%Y-%m-%d").to_string() != current {
+            conn.execute(
+                "UPDATE reminders SET scheduled_date=?2,snoozed_until=NULL,notified_for=NULL,modified_at=?3
+                 WHERE id=?1 AND status='pending' AND scheduled_date=?4",
+                params![id, date.format("%Y-%m-%d").to_string(), now(), current],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 /// Claim only the occurrence actually shown. A snooze or date edit clears the
@@ -439,7 +500,7 @@ fn next_recurrence(
     current: NaiveDate,
     time: NaiveTime,
     recurrence: &str,
-    as_of: DateTime<Local>,
+    after: NaiveDateTime,
 ) -> Option<NaiveDate> {
     let mut date = current;
     let mut month = ((current.year() - anchor.year()) * 12 + current.month() as i32
@@ -455,7 +516,7 @@ fn next_recurrence(
             }
             _ => return None,
         };
-        if date.and_time(time) > as_of.naive_local() {
+        if date.and_time(time) > after {
             return Some(date);
         }
     }
@@ -494,7 +555,7 @@ pub fn set_status_at(
             NaiveTime::parse_from_str(&due_time, "%H:%M")
                 .map_err(|_| rusqlite::Error::InvalidQuery)?
         };
-        let next = next_recurrence(anchor, current, time, &cadence, as_of)
+        let next = next_recurrence(anchor, current, time, &cadence, as_of.naive_local())
             .ok_or(rusqlite::Error::InvalidQuery)?;
         conn.execute(
             "UPDATE reminders SET scheduled_date=?2,status='pending',snoozed_until=NULL,notified_for=NULL,modified_at=?3 WHERE id=?1",
@@ -529,6 +590,43 @@ mod tests {
             "blocks": [{"type":"text", "runs": chips.iter().map(|(id,date)| serde_json::json!({"type":"dateChip", "attrs":{"chipId":id,"date":date,"label":date}})).collect::<Vec<_>>() }],
             "plain": "dates"
         }).to_string()
+    }
+
+    #[test]
+    fn ignored_repeats_notify_again_on_their_next_occurrence() {
+        let d = db();
+        let content = serde_json::json!({"blocks":[{"type":"text","runs":[{"type":"dateChip","attrs":{"chipId":"c","date":"2026-11-01","time":"09:00","recurrence":"daily"}}]}],"plain":"stretch"}).to_string();
+        notes::create(&d.conn, "n", &content, "#FFF9B1").unwrap();
+        let at = |day, hour| {
+            Local
+                .with_ymd_and_hms(2026, 11, day, hour, 0, 0)
+                .single()
+                .unwrap()
+        };
+        let announce = |when| {
+            let due = unannounced_due_at(&d.conn, when).unwrap();
+            for row in &due {
+                mark_announced(&d.conn, row).unwrap();
+            }
+            due.into_iter()
+                .map(|row| row.scheduled_date)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(announce(at(1, 9)), ["2026-11-01"]);
+        // Ignored: nothing more until the next occurrence arrives.
+        assert!(announce(at(1, 20)).is_empty());
+        assert!(announce(at(2, 8)).is_empty());
+        assert_eq!(announce(at(2, 9)), ["2026-11-02"]);
+        // Days the app missed collapse into one notification for the latest.
+        assert_eq!(announce(at(5, 10)), ["2026-11-05"]);
+        assert!(announce(at(5, 11)).is_empty());
+        // A snooze past the next occurrence is kept; when it ends, the one
+        // notification is for that day's occurrence.
+        let id = due_at(&d.conn, at(5, 11)).unwrap().remove(0).id;
+        snooze(&d.conn, &id, at(6, 12).with_timezone(&Utc)).unwrap();
+        assert!(announce(at(6, 10)).is_empty());
+        assert_eq!(announce(at(6, 12)), ["2026-11-06"]);
+        assert!(announce(at(6, 13)).is_empty());
     }
 
     #[test]

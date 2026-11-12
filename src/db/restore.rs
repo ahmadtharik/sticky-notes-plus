@@ -164,6 +164,8 @@ struct StoredImage {
 }
 
 pub fn apply(db: &Mutex<Db>, plan: &RestorePlan) -> Result<Restored> {
+    // Keeps orphan cleanup from deleting image files before their rows exist.
+    let _import = attachments::ImportGuard::new(attachments::storage(&lock(db).conn)?);
     let mut created = Vec::new();
     let result = restore(db, plan, &mut created);
     if result.is_err() {
@@ -173,6 +175,30 @@ pub fn apply(db: &Mutex<Db>, plan: &RestorePlan) -> Result<Restored> {
         }
     }
     result
+}
+
+/// Each import snapshots the whole database first; older snapshots are only
+/// disk use (and an old copy of the encrypted Google token), so keep a few.
+const KEPT_RESTORE_BACKUPS: usize = 2;
+
+/// Deletes all but the newest `keep` pre-import backups in `folder`.
+fn prune_restore_backups(folder: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(folder) else {
+        return;
+    };
+    let mut backups: Vec<_> = entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("before-restore-") && name.ends_with(".db")
+        })
+        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+        .collect();
+    backups.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    for (_, path) in backups.into_iter().skip(keep) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn restore(db: &Mutex<Db>, plan: &RestorePlan, created: &mut Vec<PathBuf>) -> Result<Restored> {
@@ -212,12 +238,13 @@ fn restore(db: &Mutex<Db>, plan: &RestorePlan, created: &mut Vec<PathBuf>) -> Re
     let guard = lock(db);
     let conn = &guard.conn;
     let database = Path::new(conn.path().context("Restore needs a saved database")?);
-    let backup = database
+    let folder = database
         .parent()
-        .context("Database directory unavailable")?
-        .join(format!("before-restore-{}.db", uuid::Uuid::new_v4()));
+        .context("Database directory unavailable")?;
+    let backup = folder.join(format!("before-restore-{}.db", uuid::Uuid::new_v4()));
     // VACUUM INTO creates a consistent snapshot, including committed WAL.
     conn.execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])?;
+    prune_restore_backups(folder, KEPT_RESTORE_BACKUPS);
     let now = chrono::Utc::now().to_rfc3339();
     let tx = conn.unchecked_transaction()?;
     let mut restored = 0;
@@ -292,6 +319,32 @@ fn restore_reminder_state(conn: &Connection, note_id: &str, note: &Value) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_newest_restore_backups_are_kept() {
+        let folder = std::env::temp_dir().join(format!("sticky-backups-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let mut made = Vec::new();
+        for index in 0..4 {
+            let path = folder.join(format!("before-restore-{index}.db"));
+            std::fs::write(&path, "db").unwrap();
+            let time =
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000 + index);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+            made.push(path);
+        }
+        let other = folder.join("sticky-notes.db");
+        std::fs::write(&other, "keep").unwrap();
+        prune_restore_backups(&folder, 2);
+        let left: Vec<bool> = made.iter().map(|path| path.exists()).collect();
+        assert_eq!(left, [false, false, true, true]);
+        assert!(other.exists());
+    }
     use crate::db::export;
 
     fn folder(prefix: &str) -> PathBuf {

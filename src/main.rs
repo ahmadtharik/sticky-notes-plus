@@ -908,10 +908,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let db = db.clone();
         let weak = board_weak.clone();
+        let windows = editor_windows.clone();
         board.on_select_color(move |id, value| {
-            let guard = db::lock(&db);
-            let _ = notes::update_meta(&guard.conn, &id, Some(&value), None, None);
-            drop(guard);
+            // An open note would write its old colour back on its next save,
+            // so change it through the window, which also saves.
+            let open = windows
+                .borrow()
+                .iter()
+                .find(|entry| entry.id == id.as_str())
+                .map(|entry| entry.window.as_weak());
+            if let Some(window) = open.and_then(|window| window.upgrade()) {
+                window.invoke_choose_color(value);
+            } else {
+                let guard = db::lock(&db);
+                let _ = notes::update_meta(&guard.conn, &id, Some(&value), None, None);
+            }
             if let Some(board) = weak.upgrade() {
                 let query = board.get_query().to_string();
                 refresh(&board, &db, &query);

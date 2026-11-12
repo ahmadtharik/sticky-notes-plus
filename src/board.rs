@@ -353,6 +353,14 @@ pub(crate) fn setup_updates(
     editors: &Rc<RefCell<Vec<EditorEntry>>>,
 ) {
     board.set_update_version(format!("Version {}", updater::CURRENT_VERSION).into());
+    // An install that failed reopened this version; say so in Settings now
+    // rather than at the next check. This also clears the leftover installer.
+    if let Some(failure) = updater::take_last_failure() {
+        board.set_update_status(
+            format!("The last update didn't install ({failure}). Check for updates to try again.")
+                .into(),
+        );
+    }
     let weak = board.as_weak();
     board.on_check_for_updates(move || {
         let Some(board) = weak.upgrade() else { return };

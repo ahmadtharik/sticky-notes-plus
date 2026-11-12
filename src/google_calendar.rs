@@ -227,13 +227,15 @@ pub fn authorization_url(client: &OAuthClient, redirect_uri: &str, pkce: &Pkce) 
     )
 }
 
-/// Reads the browser's redirect request line. `Ok(None)` is a request for
-/// another path (such as /favicon.ico) that the listener should ignore.
+/// Reads the browser's redirect request line. `Ok(None)` means the request
+/// isn't Google's answer to this sign-in (another path such as /favicon.ico,
+/// an empty or garbled request, or another `state`), so the listener ignores
+/// it and keeps waiting. Only a response carrying this request's `state` can
+/// finish or fail the sign-in.
 pub fn parse_redirect(request_line: &str, expected_state: &str) -> anyhow::Result<Option<String>> {
-    let target = request_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| anyhow!("Malformed sign-in redirect"))?;
+    let Some(target) = request_line.split_whitespace().nth(1) else {
+        return Ok(None);
+    };
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     if path != "/" {
         return Ok(None);
@@ -245,6 +247,9 @@ pub fn parse_redirect(request_line: &str, expected_state: &str) -> anyhow::Resul
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.as_str())
     };
+    if get("state") != Some(expected_state) {
+        return Ok(None);
+    }
     if let Some(error) = get("error") {
         return Err(anyhow!(if error == "access_denied" {
             "Google sign-in was cancelled".to_owned()
@@ -252,10 +257,6 @@ pub fn parse_redirect(request_line: &str, expected_state: &str) -> anyhow::Resul
             format!("Google sign-in failed: {error}")
         }));
     }
-    anyhow::ensure!(
-        get("state") == Some(expected_state),
-        "Sign-in response did not match this request"
-    );
     get("code")
         .map(|code| Some(code.to_owned()))
         .ok_or_else(|| anyhow!("Google did not return an authorization code"))
@@ -1037,7 +1038,17 @@ mod tests {
             parse_redirect("GET /favicon.ico HTTP/1.1", "s").unwrap(),
             None
         );
-        assert!(parse_redirect("GET /?state=other&code=c HTTP/1.1", "s").is_err());
+        // Anything that isn't this sign-in's answer is ignored, not fatal.
+        for ignored in [
+            "",
+            "GARBAGE",
+            "GET / HTTP/1.1",
+            "GET /?state=other&code=c HTTP/1.1",
+            "GET /?error=access_denied&state=other HTTP/1.1",
+        ] {
+            assert_eq!(parse_redirect(ignored, "s").unwrap(), None, "{ignored}");
+        }
+        assert!(parse_redirect("GET /?state=s HTTP/1.1", "s").is_err());
         let cancelled =
             parse_redirect("GET /?error=access_denied&state=s HTTP/1.1", "s").unwrap_err();
         assert_eq!(cancelled.to_string(), "Google sign-in was cancelled");
