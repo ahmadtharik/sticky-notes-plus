@@ -562,72 +562,99 @@ pub(crate) fn track_board_geometry(board: &BoardWindow, db: &Arc<Mutex<Db>>) {
     });
 }
 
+thread_local! {
+    /// A delivery thread is showing notifications; UI thread only.
+    static DELIVERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Surface newly due reminders once per occurrence, including after the app
-/// wakes or starts with overdue notes. The board is the reliable action
-/// surface until an installed Windows toast identity is available.
+/// wakes or starts with overdue notes. Windows notifications are shown on a
+/// worker thread, without the database lock, so a slow notification service
+/// can't stall the app. The board's due list is the reliable fallback for any
+/// that can't be shown, such as before an installed toast identity exists.
 pub(crate) fn surface_unannounced_due(board: &BoardWindow, db: &Arc<Mutex<Db>>) {
-    let rows = {
+    if DELIVERING.get() {
+        return;
+    }
+    let due = {
         let guard = db::lock(db);
         reminders::unannounced_due_at(&guard.conn, Local::now())
             .unwrap_or_default()
             .into_iter()
-            .filter(|row| {
-                notes::get(&guard.conn, &row.note_id)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|note| note.deleted_at.is_none())
+            .filter_map(|row| {
+                let note = notes::get(&guard.conn, &row.note_id).ok().flatten()?;
+                if note.deleted_at.is_some() {
+                    return None;
+                }
+                let name = calendar_sync::reminder_name(
+                    &note.content,
+                    note.title.as_deref(),
+                    &row.chip_id,
+                );
+                let detail = name.note.unwrap_or_else(|| row.label.clone());
+                Some((row, name.title, detail))
             })
             .collect::<Vec<_>>()
     };
-    if rows.is_empty() {
+    if due.is_empty() {
         return;
     }
     refresh_due_reminders(board, db);
-    let mut fallback = Vec::new();
+    #[cfg(windows)]
     {
+        DELIVERING.set(true);
+        let weak = board.as_weak();
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let results = due
+                .into_iter()
+                .map(|(row, title, detail)| {
+                    let shown = notification::show(&row, &title, &detail).unwrap_or_else(|error| {
+                        eprintln!("Windows reminder delivery unavailable: {error:#}");
+                        false
+                    });
+                    (row, shown)
+                })
+                .collect::<Vec<_>>();
+            let _ = slint::invoke_from_event_loop(move || {
+                DELIVERING.set(false);
+                let mut undelivered = Vec::new();
+                {
+                    let guard = db::lock(&db);
+                    for (row, shown) in results {
+                        if shown {
+                            let _ = reminders::mark_announced(&guard.conn, &row);
+                        } else {
+                            undelivered.push(row);
+                        }
+                    }
+                }
+                if let Some(board) = weak.upgrade() {
+                    show_undelivered(&board, &db, undelivered);
+                }
+            });
+        });
+    }
+    #[cfg(not(windows))]
+    show_undelivered(board, db, due.into_iter().map(|(row, ..)| row).collect());
+}
+
+/// Reminders a notification couldn't show: open the board on its due list.
+fn show_undelivered(board: &BoardWindow, db: &Arc<Mutex<Db>>, rows: Vec<reminders::ReminderRow>) {
+    if rows.is_empty() {
+        return;
+    }
+    board.set_reminder_panel_open(true);
+    board.set_settings_open(false);
+    if board.get_board_view() != "notes" {
+        board.set_board_view("notes".into());
+        let query = board.get_query().to_string();
+        refresh(board, db, &query);
+    }
+    if show_board(board).is_ok() {
         let guard = db::lock(db);
         for row in rows {
-            let mut delivered = false;
-            #[cfg(windows)]
-            {
-                let name = notes::get(&guard.conn, &row.note_id)
-                    .ok()
-                    .flatten()
-                    .map(|note| {
-                        calendar_sync::reminder_name(
-                            &note.content,
-                            note.title.as_deref(),
-                            &row.chip_id,
-                        )
-                    });
-                let (title, detail) = name.map_or_else(Default::default, |name| {
-                    (name.title, name.note.unwrap_or_else(|| row.label.clone()))
-                });
-                match notification::show(&row, &title, &detail) {
-                    Ok(shown) => delivered = shown,
-                    Err(error) => eprintln!("Windows reminder delivery unavailable: {error:#}"),
-                }
-            }
-            if delivered {
-                let _ = reminders::mark_announced(&guard.conn, &row);
-            } else {
-                fallback.push(row);
-            }
-        }
-    }
-    if !fallback.is_empty() {
-        board.set_reminder_panel_open(true);
-        board.set_settings_open(false);
-        if board.get_board_view() != "notes" {
-            board.set_board_view("notes".into());
-            let query = board.get_query().to_string();
-            refresh(board, db, &query);
-        }
-        if show_board(board).is_ok() {
-            let guard = db::lock(db);
-            for row in fallback {
-                let _ = reminders::mark_announced(&guard.conn, &row);
-            }
+            let _ = reminders::mark_announced(&guard.conn, &row);
         }
     }
 }

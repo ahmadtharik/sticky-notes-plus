@@ -389,6 +389,71 @@ pub(crate) fn sync_attachments(
 }
 
 #[cfg(windows)]
+type ImageJob = Box<dyn FnOnce(Result<attachments::PreparedImage, String>)>;
+
+#[cfg(windows)]
+thread_local! {
+    /// What to do with each image being prepared; UI thread only.
+    static IMAGE_JOBS: RefCell<std::collections::HashMap<u64, ImageJob>> =
+        RefCell::new(std::collections::HashMap::new());
+    static NEXT_IMAGE_JOB: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Decodes and thumbnails an image on a worker thread, then hands it to
+/// `finish` on the UI thread, so a large photo doesn't freeze the note.
+/// Preparing only works in memory; `finish` writes the files and the row.
+#[cfg(windows)]
+pub(crate) fn prepare_image_in_background(
+    prepare: impl FnOnce() -> Result<attachments::PreparedImage, String> + Send + 'static,
+    finish: impl FnOnce(Result<attachments::PreparedImage, String>) + 'static,
+) {
+    let job = NEXT_IMAGE_JOB.get();
+    NEXT_IMAGE_JOB.set(job + 1);
+    IMAGE_JOBS.with(|jobs| jobs.borrow_mut().insert(job, Box::new(finish)));
+    std::thread::spawn(move || {
+        let result = prepare();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(finish) = IMAGE_JOBS.with(|jobs| jobs.borrow_mut().remove(&job)) {
+                finish(result);
+            }
+        });
+    });
+}
+
+/// Where and how an editor saves: the database, note ID, save state and board.
+#[cfg(windows)]
+type SaveTarget<'a> = (
+    &'a Arc<Mutex<Db>>,
+    &'a str,
+    &'a Rc<RefCell<EditorSaveState>>,
+    &'a slint::Weak<BoardWindow>,
+);
+
+/// Inserts a prepared image into the note and reports how it went.
+#[cfg(windows)]
+fn finish_image(
+    window: &NoteWindow,
+    native: &NativeRichEditor,
+    prepared: Result<attachments::PreparedImage, String>,
+    save: SaveTarget,
+    failure: &str,
+) {
+    let (db, id, state, board) = save;
+    match prepared.and_then(|prepared| insert_native_image(window, native, db, id, prepared)) {
+        Ok(()) => {
+            if window.get_format_status() == ADDING_IMAGE {
+                window.set_format_status("".into());
+            }
+            flush_editor(db, id, window, state, board);
+        }
+        Err(error) => window.set_format_status(format!("{failure}: {error}").into()),
+    }
+}
+
+#[cfg(windows)]
+const ADDING_IMAGE: &str = "Adding image\u{2026}";
+
+#[cfg(windows)]
 pub(crate) fn insert_native_image(
     window: &NoteWindow,
     native: &NativeRichEditor,
@@ -597,11 +662,28 @@ pub(crate) fn open_editor(
             let result = image_picker::select(window.window()).and_then(|path| {
                 if let Some(path) = path {
                     #[cfg(windows)]
-                    if let Some(native) = native_for_image.borrow().as_ref() {
-                        let prepared = attachments::prepare_file(&path)?;
-                        insert_native_image(&window, native, &db, &id, prepared)
-                            .map_err(anyhow::Error::msg)?;
-                        flush_editor(&db, &id, &window, &state, &board);
+                    if native_for_image.borrow().is_some() {
+                        window.set_format_status(ADDING_IMAGE.into());
+                        let weak = weak.clone();
+                        let (db, id, state, board) =
+                            (db.clone(), id.clone(), state.clone(), board.clone());
+                        let native_for_image = native_for_image.clone();
+                        prepare_image_in_background(
+                            move || attachments::prepare_file(&path).map_err(|e| e.to_string()),
+                            move |prepared| {
+                                let Some(window) = weak.upgrade() else { return };
+                                if let Some(native) = native_for_image.borrow().as_ref() {
+                                    let save = (&db, id.as_str(), &state, &board);
+                                    finish_image(
+                                        &window,
+                                        native,
+                                        prepared,
+                                        save,
+                                        "Couldn't add image",
+                                    );
+                                }
+                            },
+                        );
                         return Ok(());
                     }
                     let guard = db::lock(&db);
@@ -1305,7 +1387,7 @@ pub(crate) fn open_editor(
                         else {
                             return;
                         };
-                        let result = result.and_then(|bytes| {
+                        let bytes = result.and_then(|bytes| {
                             if !flush_editor(
                                 &paste_db,
                                 &paste_id,
@@ -1315,16 +1397,46 @@ pub(crate) fn open_editor(
                             ) {
                                 return Err("Save pending edits before pasting an image".into());
                             }
-                            let prepared = attachments::prepare_bytes(bytes, "Pasted image.png")
-                                .map_err(|error| error.to_string())?;
-                            insert_native_image(&window, &native, &paste_db, &paste_id, prepared)?;
-                            flush_editor(&paste_db, &paste_id, &window, &paste_state, &paste_board);
-                            Ok(())
+                            Ok(bytes)
                         });
-                        if let Err(error) = result {
-                            window
-                                .set_format_status(format!("Couldn't paste image: {error}").into());
-                        }
+                        let bytes = match bytes {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
+                                window.set_format_status(
+                                    format!("Couldn't paste image: {error}").into(),
+                                );
+                                return;
+                            }
+                        };
+                        window.set_format_status(ADDING_IMAGE.into());
+                        let weak = paste_window.clone();
+                        let native = Rc::downgrade(&native);
+                        let (db, id, state, board) = (
+                            paste_db.clone(),
+                            paste_id.clone(),
+                            paste_state.clone(),
+                            paste_board.clone(),
+                        );
+                        prepare_image_in_background(
+                            move || {
+                                attachments::prepare_bytes(bytes, "Pasted image.png")
+                                    .map_err(|error| error.to_string())
+                            },
+                            move |prepared| {
+                                if let (Some(window), Some(native)) =
+                                    (weak.upgrade(), native.upgrade())
+                                {
+                                    let save = (&db, id.as_str(), &state, &board);
+                                    finish_image(
+                                        &window,
+                                        &native,
+                                        prepared,
+                                        save,
+                                        "Couldn't paste image",
+                                    );
+                                }
+                            },
+                        );
                     });
                     let image_db = db.clone();
                     let image_note = id.to_owned();
