@@ -1521,6 +1521,11 @@ pub(crate) fn open_editor(
                                     window.window().with_winit_window(|native_window| native_window.request_redraw());
                                 }
                             }) { return WinitWindowEventResult::PreventDefault; }
+                            // Fit the editor to the new layout before this frame
+                            // draws, so it doesn't trail the window by a frame.
+                            if let Some(window) = frame_window.upgrade() {
+                                native_for_resize.set_layout_bounds([window.get_editor_left(), window.get_editor_top(), window.get_editor_width(), window.get_editor_height()]);
+                            }
                             let post_window = frame_window.clone();
                             let post_native = Rc::downgrade(&native_for_resize);
                             native_for_resize.repaint_after_parent(move || {
@@ -1542,7 +1547,7 @@ pub(crate) fn open_editor(
                             }
                         }
                         i_slint_backend_winit::winit::event::WindowEvent::Resized(_) => {
-                            native_for_resize.layout();
+                            native_for_resize.note_resized();
                             if let Some(window) = frame_window.upgrade() {
                                 let [width, height] = native_for_resize.client_size();
                                 window.set_native_client_width(width);

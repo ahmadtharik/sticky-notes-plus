@@ -124,6 +124,10 @@ struct Inner {
     paint_timer: slint::Timer,
     frame_timer: slint::Timer,
     last_frame: Cell<Option<Instant>>,
+    /// Set when the window is resized, so the next frame isn't throttled.
+    resized: Cell<bool>,
+    /// Re-fits images to a new width once resizing pauses.
+    image_fit_timer: slint::Timer,
     repaint_needed: Cell<bool>,
     on_change: RefCell<Box<dyn FnMut(NativeDocument)>>,
     weak_self: RefCell<Weak<Inner>>,
@@ -165,6 +169,30 @@ pub struct NativeMetrics {
 }
 
 impl Inner {
+    fn flush_pending_change(&self) {
+        if self.composing.get() {
+            // Save/close must commit the current composition, not silently
+            // drop it while normal autosave correctly waits for IME END.
+            unsafe {
+                use windows_sys::Win32::UI::Input::Ime::{
+                    ImmGetContext, ImmNotifyIME, ImmReleaseContext, CPS_COMPLETE, NI_COMPOSITIONSTR,
+                };
+                let context = ImmGetContext(self.hwnd);
+                if !context.is_null() {
+                    ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_COMPLETE, 0);
+                    ImmReleaseContext(self.hwnd, context);
+                }
+            }
+            self.composing.set(false);
+            self.pending_change.set(true);
+        }
+        if !self.pending_change.replace(false) {
+            return;
+        }
+        self.change_timer.stop();
+        self.emit_change();
+    }
+
     fn dispatch_image_paste(&self, result: Result<Vec<u8>, String>) {
         // The callback rebuilds the control and re-enters its window procedure.
         let callback = self.image_paste.borrow_mut().take();
@@ -379,6 +407,8 @@ impl NativeRichEditor {
             paint_timer: slint::Timer::default(),
             frame_timer: slint::Timer::default(),
             last_frame: Cell::new(None),
+            resized: Cell::new(false),
+            image_fit_timer: slint::Timer::default(),
             repaint_needed: Cell::new(true),
             on_change: RefCell::new(Box::new(on_change)),
             weak_self: RefCell::new(Weak::new()),
@@ -476,27 +506,7 @@ impl NativeRichEditor {
     /// that have reached the child HWND but not the Slint model from being
     /// dropped during a close, explicit Save, or application quit.
     pub fn flush_pending_change(&self) {
-        if self.inner.composing.get() {
-            // Save/close must commit the current composition, not silently
-            // drop it while normal autosave correctly waits for IME END.
-            unsafe {
-                use windows_sys::Win32::UI::Input::Ime::{
-                    ImmGetContext, ImmNotifyIME, ImmReleaseContext, CPS_COMPLETE, NI_COMPOSITIONSTR,
-                };
-                let context = ImmGetContext(self.inner.hwnd);
-                if !context.is_null() {
-                    ImmNotifyIME(context, NI_COMPOSITIONSTR, CPS_COMPLETE, 0);
-                    ImmReleaseContext(self.inner.hwnd, context);
-                }
-            }
-            self.inner.composing.set(false);
-            self.inner.pending_change.set(true);
-        }
-        if !self.inner.pending_change.replace(false) {
-            return;
-        }
-        self.inner.change_timer.stop();
-        self.inner.emit_change();
+        self.inner.flush_pending_change();
     }
 
     #[cfg(feature = "dev-tools")]
@@ -669,26 +679,21 @@ impl NativeRichEditor {
             .layout_bounds
             .get()
             .is_none_or(|previous| previous[2] != bounds[2]);
-        let restore = if width_changed && !self.inner.images.borrow().is_empty() {
-            self.flush_pending_change();
-            Some(unsafe {
-                (
-                    document_from_control(self.inner.hwnd),
-                    selection(self.inner.hwnd),
-                )
-            })
-        } else {
-            None
-        };
         self.inner.layout_bounds.set(Some(bounds));
         self.layout();
-        if let Some((document, range)) = restore {
-            self.inner.suppress_change.set(true);
-            unsafe {
-                set_document(self.inner.hwnd, &document);
-                set_selection(self.inner.hwnd, range);
-            }
-            self.inner.suppress_change.set(false);
+        if width_changed && !self.inner.images.borrow().is_empty() {
+            // Re-fitting images reloads the whole document, which is too slow
+            // to repeat at every step of a drag; do it once resizing pauses.
+            let weak = Rc::downgrade(&self.inner);
+            self.inner.image_fit_timer.start(
+                slint::TimerMode::SingleShot,
+                Duration::from_millis(120),
+                move || {
+                    if let Some(inner) = weak.upgrade() {
+                        refit_images(&inner);
+                    }
+                },
+            );
         }
         true
     }
@@ -780,6 +785,11 @@ impl NativeRichEditor {
         // The active note runs at 60 frames/second so its header slides in
         // smoothly; RichEdit text input and caret painting bypass this filter.
         let interval = Duration::from_millis(if foreground == self.parent { 16 } else { 200 });
+        if self.inner.resized.replace(false) {
+            self.inner.frame_timer.stop();
+            self.inner.last_frame.set(Some(Instant::now()));
+            return true;
+        }
         if let Some(last) = self.inner.last_frame.get() {
             let elapsed = last.elapsed();
             if elapsed < interval {
@@ -795,6 +805,13 @@ impl NativeRichEditor {
         }
         self.inner.last_frame.set(Some(Instant::now()));
         true
+    }
+
+    /// Lets the next frame through at once and keeps the editor in step with
+    /// the window while it's being resized.
+    pub fn note_resized(&self) {
+        self.inner.resized.set(true);
+        self.layout();
     }
 
     pub fn update_scale_factor(&self, scale_factor: f64) {
@@ -823,6 +840,23 @@ impl Drop for NativeRichEditor {
                 SetWindowLongPtrW(self.parent, GWL_STYLE, style & !(WS_CLIPCHILDREN as isize));
             }
         }
+    }
+}
+
+/// Reloads the document so its images fit the editor's current width,
+/// keeping the selection and any unsaved typing.
+fn refit_images(inner: &Inner) {
+    if inner.images.borrow().is_empty() {
+        return;
+    }
+    inner.flush_pending_change();
+    unsafe {
+        let document = document_from_control(inner.hwnd);
+        let range = selection(inner.hwnd);
+        inner.suppress_change.set(true);
+        set_document(inner.hwnd, &document);
+        set_selection(inner.hwnd, range);
+        inner.suppress_change.set(false);
     }
 }
 
@@ -2739,6 +2773,8 @@ mod tests {
         );
         for width in [300.0, 180.0, 400.0] {
             editor.set_layout_bounds([0.0, 0.0, width, 400.0]);
+            // Runs from a timer once a drag pauses; call it directly here.
+            super::refit_images(&editor.inner);
             let document = editor.document();
             assert_eq!(document.text, source);
             assert_eq!(document.chip_ids, ids);
