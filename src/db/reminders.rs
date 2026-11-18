@@ -329,14 +329,17 @@ pub fn due_at(conn: &Connection, as_of: DateTime<Local>) -> rusqlite::Result<Vec
     let date = as_of.format("%Y-%m-%d").to_string();
     let time = as_of.format("%H:%M").to_string();
     let utc = as_of.with_timezone(&Utc).to_rfc3339();
+    let date_only = date_only_time(conn).format("%H:%M").to_string();
     let mut stmt = conn.prepare(
         "SELECT id,note_id,chip_id,due_date,due_time,scheduled_date,recurrence,snoozed_until,notified_for,label,status,created_at,modified_at
          FROM reminders WHERE status='pending'
-         AND (scheduled_date<?1 OR (scheduled_date=?1 AND due_time<=?2))
+         AND (scheduled_date<?1 OR (scheduled_date=?1 AND (CASE WHEN due_time='' THEN ?4 ELSE due_time END)<=?2))
          AND (snoozed_until IS NULL OR snoozed_until<=?3)
          ORDER BY scheduled_date,due_time,note_id,chip_id",
     )?;
-    let result = stmt.query_map(params![date, time, utc], row)?.collect();
+    let result = stmt
+        .query_map(params![date, time, utc, date_only], row)?
+        .collect();
     result
 }
 
@@ -350,6 +353,23 @@ pub fn due_on(conn: &Connection, as_of: NaiveDate) -> rusqlite::Result<Vec<Remin
         .earliest()
         .ok_or_else(|| rusqlite::Error::InvalidParameterName("invalid local test date".into()))?;
     due_at(conn, local)
+}
+
+/// When reminders with only a date notify, from Settings (9:00 by default).
+pub fn date_only_time(conn: &Connection) -> NaiveTime {
+    crate::settings::load(conn)
+        .ok()
+        .and_then(|preferences| NaiveTime::parse_from_str(&preferences.reminder_time, "%H:%M").ok())
+        .unwrap_or_else(|| NaiveTime::from_hms_opt(9, 0, 0).unwrap())
+}
+
+/// The reminder's time of day, using the date-only time when it has none.
+fn time_of(due_time: &str, date_only: NaiveTime) -> Option<NaiveTime> {
+    if due_time.is_empty() {
+        Some(date_only)
+    } else {
+        NaiveTime::parse_from_str(due_time, "%H:%M").ok()
+    }
 }
 
 fn occurrence_key(row: &ReminderRow) -> String {
@@ -395,6 +415,7 @@ fn roll_elapsed_repeats(conn: &Connection, as_of: DateTime<Local>) -> rusqlite::
             },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let date_only = date_only_time(conn);
     for (id, anchor, current, due_time, cadence) in rows {
         let (Ok(anchor), Ok(mut date)) = (
             NaiveDate::parse_from_str(&anchor, "%Y-%m-%d"),
@@ -402,13 +423,8 @@ fn roll_elapsed_repeats(conn: &Connection, as_of: DateTime<Local>) -> rusqlite::
         ) else {
             continue;
         };
-        let time = if due_time.is_empty() {
-            NaiveTime::MIN
-        } else {
-            match NaiveTime::parse_from_str(&due_time, "%H:%M") {
-                Ok(time) => time,
-                Err(_) => continue,
-            }
+        let Some(time) = time_of(&due_time, date_only) else {
+            continue;
         };
         // Step to the latest occurrence that has already arrived.
         while let Some(next) = next_recurrence(anchor, date, time, &cadence, date.and_time(time))
@@ -427,6 +443,96 @@ fn roll_elapsed_repeats(conn: &Connection, as_of: DateTime<Local>) -> rusqlite::
     Ok(())
 }
 
+/// When a pending reminder notifies: its occurrence, or the end of a snooze
+/// that runs past it.
+pub fn fire_at(row: &ReminderRow, date_only: NaiveTime) -> Option<DateTime<Local>> {
+    use chrono::TimeZone;
+    let date = NaiveDate::parse_from_str(&row.scheduled_date, "%Y-%m-%d").ok()?;
+    let at = Local
+        .from_local_datetime(&date.and_time(time_of(&row.due_time, date_only)?))
+        .earliest()?;
+    let snoozed = row
+        .snoozed_until
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Local));
+    Some(match snoozed {
+        Some(snoozed) if snoozed > at => snoozed,
+        _ => at,
+    })
+}
+
+/// Names one notification handed to Windows: the occurrence and the instant.
+pub fn windows_key(row: &ReminderRow, fire: DateTime<Local>) -> String {
+    format!(
+        "{}@{}",
+        occurrence_key(row),
+        fire.with_timezone(&Utc).to_rfc3339()
+    )
+}
+
+/// Pending reminders that notify after `as_of` and no later than `until`,
+/// soonest first, with when each one notifies.
+pub fn upcoming(
+    conn: &Connection,
+    as_of: DateTime<Local>,
+    until: DateTime<Local>,
+    limit: usize,
+) -> rusqlite::Result<Vec<(ReminderRow, DateTime<Local>)>> {
+    let date_only = date_only_time(conn);
+    let mut stmt = conn.prepare(
+        "SELECT id,note_id,chip_id,due_date,due_time,scheduled_date,recurrence,snoozed_until,notified_for,label,status,created_at,modified_at
+         FROM reminders WHERE status='pending'",
+    )?;
+    let mut rows = stmt
+        .query_map([], row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|row| row.notified_for.as_deref() != Some(occurrence_key(row).as_str()))
+        .filter_map(|row| {
+            let fire = fire_at(&row, date_only)?;
+            (fire > as_of && fire <= until).then_some((row, fire))
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|(_, fire)| *fire);
+    rows.truncate(limit);
+    Ok(rows)
+}
+
+/// Remembers that Windows will show this reminder's notification itself.
+pub fn record_windows_toast(
+    conn: &Connection,
+    reminder_id: &str,
+    key: &str,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO windows_toasts(reminder_id,key) VALUES (?1,?2)
+         ON CONFLICT(reminder_id) DO UPDATE SET key=excluded.key",
+        params![reminder_id, key],
+    )?;
+    conn.execute(
+        "DELETE FROM windows_toasts WHERE reminder_id NOT IN (SELECT id FROM reminders)",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Whether Windows was asked to show exactly this notification, so the app
+/// shouldn't show it a second time.
+pub fn shown_by_windows(conn: &Connection, row: &ReminderRow) -> rusqlite::Result<bool> {
+    let Some(fire) = fire_at(row, date_only_time(conn)) else {
+        return Ok(false);
+    };
+    Ok(conn
+        .query_row(
+            "SELECT key FROM windows_toasts WHERE reminder_id=?1",
+            [&row.id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .is_some_and(|key| key == windows_key(row, fire)))
+}
+
 /// Claim only the occurrence actually shown. A snooze or date edit clears the
 /// marker, and a new recurrence has a different scheduled key.
 pub fn mark_announced(conn: &Connection, row: &ReminderRow) -> rusqlite::Result<bool> {
@@ -437,6 +543,55 @@ pub fn mark_announced(conn: &Connection, row: &ReminderRow) -> rusqlite::Result<
          AND (notified_for IS NULL OR notified_for<>?2)",
         params![row.id, key, now(), row.scheduled_date, row.due_time],
     )? == 1)
+}
+
+/// How long a snooze lasts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnoozeFor {
+    TenMinutes,
+    OneHour,
+    /// Tomorrow at the date-only reminder time.
+    Tomorrow,
+}
+
+impl SnoozeFor {
+    /// The board's choices, in the order its snooze menu lists them.
+    pub fn from_index(index: i32) -> Self {
+        match index {
+            1 => Self::OneHour,
+            2 => Self::Tomorrow,
+            _ => Self::TenMinutes,
+        }
+    }
+
+    pub fn until(self, conn: &Connection, as_of: DateTime<Local>) -> DateTime<Utc> {
+        use chrono::TimeZone;
+        let later = |minutes| as_of.with_timezone(&Utc) + chrono::Duration::minutes(minutes);
+        match self {
+            Self::TenMinutes => later(10),
+            Self::OneHour => later(60),
+            Self::Tomorrow => as_of
+                .date_naive()
+                .succ_opt()
+                .and_then(|day| {
+                    Local
+                        .from_local_datetime(&day.and_time(date_only_time(conn)))
+                        .earliest()
+                })
+                .map(|time| time.with_timezone(&Utc))
+                .unwrap_or_else(|| later(24 * 60)),
+        }
+    }
+}
+
+/// Snoozes a reminder for one of the standard choices.
+pub fn snooze_for(
+    conn: &Connection,
+    id: &str,
+    choice: SnoozeFor,
+    as_of: DateTime<Local>,
+) -> rusqlite::Result<()> {
+    snooze(conn, id, choice.until(conn, as_of))
 }
 
 pub fn snooze(conn: &Connection, id: &str, until: DateTime<Utc>) -> rusqlite::Result<()> {
@@ -466,7 +621,9 @@ pub fn activate(
         .query_row(
             "SELECT r.note_id FROM reminders r JOIN notes n ON n.id=r.note_id
          WHERE r.id=?1 AND n.deleted_at IS NULL AND r.status='pending'
-         AND r.scheduled_date || 'T' || r.due_time=?2 AND r.notified_for=?2",
+         AND r.scheduled_date || 'T' || r.due_time=?2
+         AND (r.notified_for=?2 OR EXISTS(SELECT 1 FROM windows_toasts w
+              WHERE w.reminder_id=r.id AND substr(w.key,1,length(?2)+1)=?2 || '@'))",
             params![activation.reminder_id, activation.occurrence],
             |row| row.get(0),
         )
@@ -474,11 +631,9 @@ pub fn activate(
     if note_id.is_some() {
         match activation.action {
             Action::Open => (),
-            Action::Snooze => snooze(
-                &transaction,
-                &activation.reminder_id,
-                as_of.with_timezone(&Utc) + chrono::Duration::minutes(10),
-            )?,
+            Action::Snooze(choice) => {
+                snooze_for(&transaction, &activation.reminder_id, choice, as_of)?
+            }
             Action::Done => {
                 set_status_at(&transaction, &activation.reminder_id, "completed", as_of)?
             }
@@ -549,12 +704,7 @@ pub fn set_status_at(
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
         let current = NaiveDate::parse_from_str(&current, "%Y-%m-%d")
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
-        let time = if due_time.is_empty() {
-            NaiveTime::from_hms_opt(0, 0, 0).unwrap()
-        } else {
-            NaiveTime::parse_from_str(&due_time, "%H:%M")
-                .map_err(|_| rusqlite::Error::InvalidQuery)?
-        };
+        let time = time_of(&due_time, date_only_time(conn)).ok_or(rusqlite::Error::InvalidQuery)?;
         let next = next_recurrence(anchor, current, time, &cadence, as_of.naive_local())
             .ok_or(rusqlite::Error::InvalidQuery)?;
         conn.execute(
@@ -673,7 +823,7 @@ mod tests {
         let row = due_at(&d.conn, at).unwrap().remove(0);
         mark_announced(&d.conn, &row).unwrap();
         let action = Activation {
-            action: Action::Snooze,
+            action: Action::Snooze(SnoozeFor::TenMinutes),
             reminder_id: row.id.clone(),
             occurrence: occurrence_key(&row),
         };
@@ -923,5 +1073,90 @@ mod tests {
         let due = due_on(&d.conn, as_of).unwrap();
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].chip_id, "task-date");
+    }
+
+    #[test]
+    fn date_only_reminders_notify_at_the_chosen_time() {
+        let d = db();
+        notes::create(&d.conn, "n", &content(&[("c", "2026-10-01")]), "#FFF9B1").unwrap();
+        let at = |hour| {
+            Local
+                .with_ymd_and_hms(2026, 10, 1, hour, 0, 0)
+                .single()
+                .unwrap()
+        };
+        assert!(due_at(&d.conn, at(8)).unwrap().is_empty());
+        assert_eq!(due_at(&d.conn, at(9)).unwrap().len(), 1);
+        let previous = crate::settings::Preferences::default();
+        let next = crate::settings::Preferences {
+            reminder_time: "07:00".into(),
+            ..previous.clone()
+        };
+        crate::settings::apply(&d.conn, &previous, &next, |_| Ok(())).unwrap();
+        assert_eq!(due_at(&d.conn, at(8)).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn snooze_choices_wait_ten_minutes_an_hour_or_until_tomorrow_morning() {
+        let d = db();
+        notes::create(&d.conn, "n", &content(&[("c", "2026-10-01")]), "#FFF9B1").unwrap();
+        let at = |day, hour, minute| {
+            Local
+                .with_ymd_and_hms(2026, 10, day, hour, minute, 0)
+                .single()
+                .unwrap()
+        };
+        let id = due_at(&d.conn, at(1, 15, 0)).unwrap()[0].id.clone();
+        for (choice, before, after) in [
+            (SnoozeFor::TenMinutes, at(1, 15, 9), at(1, 15, 10)),
+            (SnoozeFor::OneHour, at(1, 15, 59), at(1, 16, 0)),
+            (SnoozeFor::Tomorrow, at(2, 8, 59), at(2, 9, 0)),
+        ] {
+            snooze_for(&d.conn, &id, choice, at(1, 15, 0)).unwrap();
+            assert!(due_at(&d.conn, before).unwrap().is_empty(), "{choice:?}");
+            assert_eq!(due_at(&d.conn, after).unwrap().len(), 1, "{choice:?}");
+        }
+    }
+
+    #[test]
+    fn notifications_windows_scheduled_are_not_repeated_and_their_buttons_work() {
+        use crate::notification::{Action, Activation};
+        let d = db();
+        let content = serde_json::json!({"blocks":[{"type":"text","runs":[{"type":"dateChip","attrs":{"chipId":"c","date":"2026-10-01","time":"14:00"}}]}],"plain":"call"}).to_string();
+        notes::create(&d.conn, "n", &content, "#FFF9B1").unwrap();
+        let at = |day, hour| {
+            Local
+                .with_ymd_and_hms(2026, 10, day, hour, 0, 0)
+                .single()
+                .unwrap()
+        };
+        // Planned from the morning; nothing yet within an hour.
+        assert!(upcoming(&d.conn, at(1, 9), at(1, 10), 10)
+            .unwrap()
+            .is_empty());
+        let (row, fire) = upcoming(&d.conn, at(1, 9), at(2, 9), 10).unwrap().remove(0);
+        assert_eq!(fire, at(1, 14));
+        record_windows_toast(&d.conn, &row.id, &windows_key(&row, fire)).unwrap();
+        // At 14:00 Windows has shown it, so the app doesn't.
+        let due = due_at(&d.conn, at(1, 14)).unwrap().remove(0);
+        assert!(shown_by_windows(&d.conn, &due).unwrap());
+        // Its buttons work although the app never showed it.
+        let snooze = Activation {
+            action: Action::Snooze(SnoozeFor::OneHour),
+            reminder_id: row.id.clone(),
+            occurrence: occurrence_key(&row),
+        };
+        assert_eq!(
+            activate(&d.conn, &snooze, at(1, 14)).unwrap().as_deref(),
+            Some("n")
+        );
+        // The snooze changes when it fires, so the app shows that one itself
+        // unless Windows is given the new time.
+        let snoozed = list_for_note(&d.conn, "n").unwrap().remove(0);
+        assert!(!shown_by_windows(&d.conn, &snoozed).unwrap());
+        let (_, later) = upcoming(&d.conn, at(1, 14), at(2, 9), 10)
+            .unwrap()
+            .remove(0);
+        assert_eq!(later, at(1, 15));
     }
 }

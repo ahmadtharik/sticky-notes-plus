@@ -346,6 +346,61 @@ pub(crate) fn setup_export(
     });
 }
 
+/// Writes a daily backup in the background: shortly after startup, then
+/// whenever the date changes while the app stays open.
+#[cfg(windows)]
+pub(crate) fn setup_backups(board: &BoardWindow, db: &Arc<Mutex<Db>>) -> Timer {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let running = Arc::new(AtomicBool::new(false));
+    let start = {
+        let db = db.clone();
+        let weak = board.as_weak();
+        move || {
+            if running.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let db = db.clone();
+            let weak = weak.clone();
+            let running = running.clone();
+            std::thread::spawn(move || {
+                let now = Local::now();
+                let result = db::backup::run_if_due(&db, now.date_naive(), &now.to_rfc3339());
+                running.store(false, Ordering::SeqCst);
+                if let Err(error) = result {
+                    let _ = slint::invoke_from_event_loop(move || {
+                        if let Some(board) = weak.upgrade() {
+                            board.set_export_status(
+                                format!("Today's automatic backup failed: {error}").into(),
+                            );
+                        }
+                    });
+                }
+            });
+        }
+    };
+    let weak = board.as_weak();
+    let folder_db = db.clone();
+    board.on_show_backups(move || {
+        let Some(board) = weak.upgrade() else { return };
+        let opened = db::backup::folder(&folder_db).and_then(|folder| {
+            std::fs::create_dir_all(&folder)?;
+            google_calendar::open_in_browser(&folder.to_string_lossy())
+        });
+        if let Err(error) = opened {
+            board.set_export_status(format!("Couldn't open the backups folder: {error}").into());
+        }
+    });
+    // Checking is a file lookup; the export only runs once a day.
+    let timer = Timer::default();
+    timer.start(
+        TimerMode::Repeated,
+        Duration::from_secs(10 * 60),
+        start.clone(),
+    );
+    Timer::single_shot(Duration::from_secs(60), start);
+    timer
+}
+
 #[cfg(windows)]
 pub(crate) fn setup_updates(
     board: &BoardWindow,
@@ -480,6 +535,7 @@ pub(crate) fn setup_calendar(board: &BoardWindow, db: &Arc<Mutex<Db>>) {
                 board.set_calendar_alert_index(index as i32);
                 board.set_calendar_include_text(config.include_note_text);
             }
+            board.set_calendar_connecting(status == SyncStatus::Connecting);
             board.set_calendar_status(status.text().into());
         });
     });
@@ -510,6 +566,8 @@ pub(crate) fn setup_calendar(board: &BoardWindow, db: &Arc<Mutex<Db>>) {
             Err(error) => board.set_calendar_status(format!("Could not save: {error}").into()),
         }
     });
+    let cancel_worker = worker.clone();
+    board.on_calendar_cancel_connect(move || cancel_worker.cancel_connect());
     let sync_worker = worker.clone();
     board.on_calendar_sync_now(move || sync_worker.sync_now());
     let weak = board.as_weak();
@@ -565,6 +623,85 @@ pub(crate) fn track_board_geometry(board: &BoardWindow, db: &Arc<Mutex<Db>>) {
 thread_local! {
     /// A delivery thread is showing notifications; UI thread only.
     static DELIVERING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// A thread is updating Windows' notification schedule; UI thread only.
+    static SCHEDULING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// The tags last handed to Windows, so an unchanged plan isn't resent.
+    static SCHEDULED_TAGS: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+/// How far ahead, and how many, notifications are handed to Windows.
+#[cfg(windows)]
+const SCHEDULE_DAYS: i64 = 14;
+#[cfg(windows)]
+const SCHEDULE_LIMIT: usize = 100;
+
+/// The reminder's name for its notification: the item, then its note.
+fn notification_text(
+    conn: &rusqlite::Connection,
+    row: &reminders::ReminderRow,
+) -> Option<(String, String)> {
+    let note = notes::get(conn, &row.note_id).ok().flatten()?;
+    if note.deleted_at.is_some() {
+        return None;
+    }
+    let name = calendar_sync::reminder_name(&note.content, note.title.as_deref(), &row.chip_id);
+    let detail = name.note.unwrap_or_else(|| row.label.clone());
+    Some((name.title, detail))
+}
+
+/// Hands upcoming reminders to Windows so they notify on time even when the
+/// app isn't running. Runs on a worker thread, and only when the plan changed.
+#[cfg(windows)]
+pub(crate) fn sync_windows_schedule(db: &Arc<Mutex<Db>>) {
+    if SCHEDULING.get() {
+        return;
+    }
+    let now = Local::now();
+    let (reminders, plans): (Vec<_>, Vec<_>) = {
+        let guard = db::lock(db);
+        reminders::upcoming(
+            &guard.conn,
+            now,
+            now + chrono::Duration::days(SCHEDULE_DAYS),
+            SCHEDULE_LIMIT,
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(row, fire)| {
+            let (title, detail) = notification_text(&guard.conn, &row)?;
+            let key = reminders::windows_key(&row, fire);
+            let xml = notification::toast_xml(&row, &title, &detail);
+            let plan = notification::Planned::new(&key, xml, fire.with_timezone(&chrono::Utc));
+            Some(((row.id, key), plan))
+        })
+        .unzip()
+    };
+    let tags: Vec<String> = plans.iter().map(|plan| plan.tag.clone()).collect();
+    if SCHEDULED_TAGS.with(|last| last.borrow().as_ref() == Some(&tags)) {
+        return;
+    }
+    SCHEDULING.set(true);
+    let db = db.clone();
+    std::thread::spawn(move || {
+        let result = notification::sync_schedule(&plans);
+        let _ = slint::invoke_from_event_loop(move || {
+            SCHEDULING.set(false);
+            match result {
+                Ok(Some(scheduled)) => {
+                    let guard = db::lock(&db);
+                    for ((id, key), scheduled) in reminders.iter().zip(scheduled) {
+                        if scheduled {
+                            let _ = reminders::record_windows_toast(&guard.conn, id, key);
+                        }
+                    }
+                    SCHEDULED_TAGS.with(|last| *last.borrow_mut() = Some(tags));
+                }
+                // No installed identity: the app shows reminders itself.
+                Ok(None) => SCHEDULED_TAGS.with(|last| *last.borrow_mut() = Some(tags)),
+                Err(error) => eprintln!("Windows reminder schedule unavailable: {error:#}"),
+            }
+        });
+    });
 }
 
 /// Surface newly due reminders once per occurrence, including after the app
@@ -581,18 +718,17 @@ pub(crate) fn surface_unannounced_due(board: &BoardWindow, db: &Arc<Mutex<Db>>) 
         reminders::unannounced_due_at(&guard.conn, Local::now())
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|row| {
-                let note = notes::get(&guard.conn, &row.note_id).ok().flatten()?;
-                if note.deleted_at.is_some() {
-                    return None;
+            .filter(|row| {
+                // Windows showed this one on schedule; don't show it twice.
+                if reminders::shown_by_windows(&guard.conn, row).unwrap_or(false) {
+                    let _ = reminders::mark_announced(&guard.conn, row);
+                    return false;
                 }
-                let name = calendar_sync::reminder_name(
-                    &note.content,
-                    note.title.as_deref(),
-                    &row.chip_id,
-                );
-                let detail = name.note.unwrap_or_else(|| row.label.clone());
-                Some((row, name.title, detail))
+                true
+            })
+            .filter_map(|row| {
+                let (title, detail) = notification_text(&guard.conn, &row)?;
+                Some((row, title, detail))
             })
             .collect::<Vec<_>>()
     };

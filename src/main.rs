@@ -327,6 +327,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     board.set_setting_dark(preferences.dark_theme);
     board.set_setting_shortcut(preferences.shortcut.clone().into());
     board.set_setting_startup(preferences.start_with_windows);
+    board
+        .set_setting_reminder_time_index(settings::reminder_time_index(&preferences.reminder_time));
     board.set_settings_status(settings_error.into());
     {
         let weak = board.as_weak();
@@ -468,6 +470,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 dark_theme: board.get_setting_dark(),
                 shortcut,
                 start_with_windows: board.get_setting_startup(),
+                reminder_time: settings::REMINDER_TIMES
+                    .get(usize::try_from(board.get_setting_reminder_time_index()).unwrap_or(2))
+                    .copied()
+                    .unwrap_or(settings::DEFAULT_REMINDER_TIME)
+                    .into(),
                 ..settings::Preferences::default()
             };
             let result = settings::apply(
@@ -491,6 +498,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let saved = preferences.borrow();
                     board.set_setting_dark(saved.dark_theme);
                     board.set_setting_startup(saved.start_with_windows);
+                    board.set_setting_reminder_time_index(settings::reminder_time_index(
+                        &saved.reminder_time,
+                    ));
                     board.set_settings_status(format!("Settings not saved: {error}").into())
                 }
             }
@@ -504,6 +514,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_updates(&board, &db, &editor_windows);
     #[cfg(windows)]
     setup_export(&board, &db, &editor_windows);
+    #[cfg(windows)]
+    let _backup_timer = setup_backups(&board, &db);
     #[cfg(windows)]
     {
         // Sign-out and shutdown end the process without a Quit, so save what
@@ -593,6 +605,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 surface_unannounced_due(&board, &db);
                 refresh_due_reminders(&board, &db);
             }
+            #[cfg(windows)]
+            sync_windows_schedule(&db);
         });
     }
 
@@ -681,13 +695,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let db = db.clone();
         let weak = board_weak.clone();
-        board.on_snooze_reminder(move |id| {
+        board.on_snooze_reminder(move |id, choice| {
             let result = {
                 let guard = db::lock(&db);
-                reminders::snooze(
+                reminders::snooze_for(
                     &guard.conn,
                     &id,
-                    chrono::Utc::now() + chrono::Duration::minutes(10),
+                    reminders::SnoozeFor::from_index(choice),
+                    chrono::Local::now(),
                 )
             };
             if result.is_ok() {
@@ -1036,6 +1051,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         open_editor(&board, &db, &id, &editor_windows);
     }
     surface_unannounced_due(&board, &db);
+    #[cfg(windows)]
+    sync_windows_schedule(&db);
     if has_tray {
         // Hiding the last window must not disable reminders, activation or
         // the tray. Explicit Quit flushes notes before terminating the app.

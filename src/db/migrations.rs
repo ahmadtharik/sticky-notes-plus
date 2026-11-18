@@ -147,6 +147,14 @@ pub fn apply(conn: &Connection) -> rusqlite::Result<i64> {
             fingerprint TEXT NOT NULL
          );",
     )?;
+    // Which reminder occurrence Windows was asked to show, and when. A table
+    // of its own, so older versions of the app can still open the database.
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS windows_toasts (
+            reminder_id TEXT PRIMARY KEY,
+            key TEXT NOT NULL
+         );",
+    )?;
     tx.execute(
         "INSERT INTO meta(key,value) VALUES ('schema_version',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         [CURRENT.to_string()],

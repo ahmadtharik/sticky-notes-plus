@@ -278,11 +278,12 @@ pub fn preview() -> Result<(), Box<dyn std::error::Error>> {
     {
         let db = db.clone();
         let weak = board.as_weak();
-        board.on_snooze_reminder(move |id| {
-            let saved = reminders::snooze(
+        board.on_snooze_reminder(move |id, choice| {
+            let saved = reminders::snooze_for(
                 &db.lock().unwrap().conn,
                 &id,
-                chrono::Utc::now() + chrono::Duration::minutes(10),
+                reminders::SnoozeFor::from_index(choice),
+                chrono::Local::now(),
             );
             if saved.is_ok() {
                 if let Some(board) = weak.upgrade() {

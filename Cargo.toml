@@ -31,7 +31,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globali
 # no private Slint APIs or second event loop are used.
 i-slint-backend-winit = { version = "=1.9.0", default-features = false, features = ["renderer-software"] }
 raw-window-handle = "0.6"
-windows = { version = "0.61.3", features = ["Win32_Graphics_Gdi", "Win32_UI_Controls_RichEdit", "Win32_UI_WindowsAndMessaging", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_SystemServices", "Win32_System_Ole", "Win32_System_WinRT", "Data_Xml_Dom", "Foundation", "Globalization", "Storage_Streams", "UI_Notifications", "Web_Http", "Web_Http_Filters", "Web_Http_Headers"] }
+windows = { version = "0.61.3", features = ["Win32_Graphics_Gdi", "Win32_UI_Controls_RichEdit", "Win32_UI_WindowsAndMessaging", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_SystemServices", "Win32_System_Ole", "Win32_System_WinRT", "Data_Xml_Dom", "Foundation", "Foundation_Collections", "Globalization", "Storage_Streams", "UI_Notifications", "Web_Http", "Web_Http_Filters", "Web_Http_Headers"] }
 windows-core = "=0.61.2"
 
 [build-dependencies]

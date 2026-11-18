@@ -279,6 +279,7 @@ export component BoardWindow inherits Window {
     in-out property <bool> setting-dark: false;
     in-out property <bool> setting-startup: false;
     in-out property <string> setting-shortcut;
+    in-out property <int> setting-reminder-time-index: 2;
     in-out property <string> settings-status;
     property <color> board-foreground: root.dark-theme ? #f1f2f5 : #25262c;
     property <color> board-muted: root.dark-theme ? #b8bdc9 : #6b7080;
@@ -295,7 +296,9 @@ export component BoardWindow inherits Window {
     in-out property <bool> calendar-include-text: true;
     in-out property <bool> calendar-confirm-disconnect: false;
     in-out property <bool> calendar-delete-calendar: false;
+    in-out property <bool> calendar-connecting: false;
     callback calendar-connect();
+    callback calendar-cancel-connect();
     callback calendar-save-options();
     callback calendar-sync-now();
     callback calendar-disconnect();
@@ -310,6 +313,7 @@ export component BoardWindow inherits Window {
     in-out property <string> export-status;
     // An import or export is running in the background.
     in-out property <bool> data-busy: false;
+    callback show-backups();
     callback export-notes();
     in-out property <bool> import-pending: false;
     in-out property <string> import-status;
@@ -356,7 +360,9 @@ export component BoardWindow inherits Window {
     callback select-color(string, string);
     callback dismiss-reminder(string);
     callback complete-reminder(string);
-    callback snooze-reminder(string);
+    /// 0 = 10 minutes, 1 = 1 hour, 2 = tomorrow.
+    callback snooze-reminder(string, int);
+    in-out property <string> snooze-menu-id;
 
     // The partial renderer does not track the Window's own background, so a
     // theme change or re-show left untouched areas stale. A full-size item is
@@ -457,12 +463,20 @@ export component BoardWindow inherits Window {
                                 vertical-alignment: center;
                             }
                             }
-                            HorizontalLayout {
+                            if root.snooze-menu-id != reminder.id: HorizontalLayout {
                                 spacing: 8px;
                                 height: 32px;
                                 Button { text: "Done"; min-width: 0px; horizontal-stretch: 1; clicked => { root.complete-reminder(reminder.id); } }
-                                Button { text: "Snooze 10m"; min-width: 0px; horizontal-stretch: 1; clicked => { root.snooze-reminder(reminder.id); } }
+                                Button { text: "Snooze…"; min-width: 0px; horizontal-stretch: 1; clicked => { root.snooze-menu-id = reminder.id; } }
                                 Button { text: "Dismiss"; min-width: 0px; horizontal-stretch: 1; clicked => { root.dismiss-reminder(reminder.id); } }
+                            }
+                            if root.snooze-menu-id == reminder.id: HorizontalLayout {
+                                spacing: 8px;
+                                height: 32px;
+                                Button { text: "10 min"; min-width: 0px; horizontal-stretch: 1; clicked => { root.snooze-menu-id = ""; root.snooze-reminder(reminder.id, 0); } }
+                                Button { text: "1 hour"; min-width: 0px; horizontal-stretch: 1; clicked => { root.snooze-menu-id = ""; root.snooze-reminder(reminder.id, 1); } }
+                                Button { text: "Tomorrow"; min-width: 0px; horizontal-stretch: 1; clicked => { root.snooze-menu-id = ""; root.snooze-reminder(reminder.id, 2); } }
+                                Button { text: "Back"; min-width: 0px; horizontal-stretch: 1; clicked => { root.snooze-menu-id = ""; } }
                             }
                         }
                     }
@@ -527,6 +541,16 @@ export component BoardWindow inherits Window {
                     }
                 }
                 SettingsSection {
+                    title: "Reminders";
+                    foreground: root.board-foreground;
+                    dark: root.dark-theme;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: "Reminders with only a date notify at"; color: root.board-foreground; vertical-alignment: center; horizontal-stretch: 1; wrap: word-wrap; }
+                        ComboBox { model: ["7:00 AM", "8:00 AM", "9:00 AM", "10:00 AM", "12:00 PM", "5:00 PM", "6:00 PM"]; current-index <=> root.setting-reminder-time-index; selected => { root.apply-settings(false); } width: 120px; }
+                    }
+                }
+                SettingsSection {
                     title: "Keyboard shortcut";
                     foreground: root.board-foreground;
                     dark: root.dark-theme;
@@ -543,9 +567,13 @@ export component BoardWindow inherits Window {
                     foreground: root.board-foreground;
                     dark: root.dark-theme;
                 Text { text: root.calendar-status; color: root.board-muted; wrap: word-wrap; }
-                if root.calendar-configured && !root.calendar-connected && !root.calendar-setup-open: HorizontalLayout {
+                if root.calendar-configured && !root.calendar-connected && !root.calendar-setup-open && !root.calendar-connecting: HorizontalLayout {
                     alignment: start;
                     Button { text: "Connect Google Calendar…"; clicked => { root.calendar-setup-open = true; } }
+                }
+                if root.calendar-connecting: HorizontalLayout {
+                    alignment: start;
+                    Button { text: "Cancel sign-in"; clicked => { root.calendar-cancel-connect(); } }
                 }
                 // First connect: choices, then the browser sign-in.
                 if root.calendar-setup-open: VerticalLayout {
@@ -615,6 +643,11 @@ export component BoardWindow inherits Window {
                         alignment: start;
                         Button { text: "Export notes…"; enabled: !root.data-busy; clicked => { root.export-notes(); } }
                         Button { text: "Import from export…"; enabled: !root.data-busy; clicked => { root.preview-import(); } }
+                    }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text { text: "A backup is saved each day and the last 7 are kept. Bring one back with Import from export."; color: root.board-muted; wrap: word-wrap; font-size: 12px; horizontal-stretch: 1; vertical-alignment: center; }
+                        Button { text: "Show backups"; clicked => { root.show-backups(); } }
                     }
                     if root.export-status != "": Text { text: root.export-status; color: root.board-muted; wrap: word-wrap; }
                     if root.import-status != "": Text { text: root.import-status; color: root.board-muted; wrap: word-wrap; }

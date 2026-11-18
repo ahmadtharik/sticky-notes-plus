@@ -9,7 +9,14 @@ pub struct Preferences {
     pub dark_theme: bool,
     pub shortcut: String,
     pub start_with_windows: bool,
+    /// When reminders that have only a date notify, as "HH:MM".
+    pub reminder_time: String,
 }
+/// The times Settings offers for date-only reminders, matching its list.
+pub const REMINDER_TIMES: [&str; 7] = [
+    "07:00", "08:00", "09:00", "10:00", "12:00", "17:00", "18:00",
+];
+pub const DEFAULT_REMINDER_TIME: &str = "09:00";
 impl Default for Preferences {
     fn default() -> Self {
         Self {
@@ -17,13 +24,26 @@ impl Default for Preferences {
             dark_theme: false,
             shortcut: crate::hotkey::DEFAULT_SHORTCUT.into(),
             start_with_windows: false,
+            reminder_time: DEFAULT_REMINDER_TIME.into(),
         }
     }
+}
+/// The Settings list entry for a saved time; 9:00 if it isn't listed.
+pub fn reminder_time_index(time: &str) -> i32 {
+    REMINDER_TIMES
+        .iter()
+        .position(|choice| *choice == time)
+        .unwrap_or(2) as i32
 }
 impl Preferences {
     pub fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.version == 1, "Unsupported settings version");
         crate::hotkey::parse_shortcut(&self.shortcut)?;
+        anyhow::ensure!(
+            self.reminder_time.len() == 5
+                && chrono::NaiveTime::parse_from_str(&self.reminder_time, "%H:%M").is_ok(),
+            "Invalid reminder time"
+        );
         Ok(())
     }
 }

@@ -7,6 +7,7 @@
 use crate::calendar_sync::{self, CalendarConfig};
 use crate::db::Db;
 use crate::google_calendar::{self, CalendarApi, OAuthClient, SyncError, Transport};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -70,17 +71,26 @@ enum Command {
 #[derive(Clone)]
 pub struct CalendarWorker {
     commands: Sender<Command>,
+    /// Set by Cancel while the browser sign-in is waiting.
+    cancel: Arc<AtomicBool>,
 }
 
 impl CalendarWorker {
     /// `on_status` runs on the worker thread; forward it to the UI thread.
     pub fn start(db: Arc<Mutex<Db>>, on_status: impl Fn(SyncStatus) + Send + 'static) -> Self {
         let (commands, receiver) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = cancel.clone();
         std::thread::Builder::new()
             .name("calendar-sync".into())
-            .spawn(move || run(db, receiver, on_status))
+            .spawn(move || run(db, receiver, worker_cancel, on_status))
             .expect("spawn calendar sync thread");
-        Self { commands }
+        Self { commands, cancel }
+    }
+
+    /// Stops waiting for a browser sign-in that the user abandoned.
+    pub fn cancel_connect(&self) {
+        self.cancel.store(true, Ordering::SeqCst);
     }
 
     pub fn sync_now(&self) {
@@ -88,6 +98,7 @@ impl CalendarWorker {
     }
 
     pub fn connect(&self, options: ConnectOptions) {
+        self.cancel.store(false, Ordering::SeqCst);
         let _ = self.commands.send(Command::Connect(options));
     }
 
@@ -132,7 +143,12 @@ struct State {
     status: Option<SyncStatus>,
 }
 
-fn run(db: Arc<Mutex<Db>>, receiver: Receiver<Command>, on_status: impl Fn(SyncStatus)) {
+fn run(
+    db: Arc<Mutex<Db>>,
+    receiver: Receiver<Command>,
+    cancel: Arc<AtomicBool>,
+    on_status: impl Fn(SyncStatus),
+) {
     // Windows.Web.Http's blocking waits need a multithreaded apartment.
     let _apartment = Apartment::multithreaded();
     let transport = match google_calendar::WinRtTransport::new() {
@@ -182,13 +198,16 @@ fn run(db: Arc<Mutex<Db>>, receiver: Receiver<Command>, on_status: impl Fn(SyncS
             Ok(Command::SettingsChanged) => forced = true,
             Ok(Command::Connect(options)) => {
                 report(&mut state, SyncStatus::Connecting);
-                let status = match connect(&state, &transport, options) {
-                    Ok(()) => {
+                let status = match connect(&state, &transport, options, &cancel) {
+                    Ok(true) => {
                         state.reconnect_needed = false;
                         state.backoff.succeeded();
                         forced = true;
                         SyncStatus::Syncing
                     }
+                    // Cancelled: back to how it was before the sign-in.
+                    Ok(false) if state.reconnect_needed => SyncStatus::ReconnectNeeded,
+                    Ok(false) => SyncStatus::NotConnected,
                     Err(error) => SyncStatus::Error(error.to_string()),
                 };
                 report(&mut state, status);
@@ -289,7 +308,8 @@ fn connect(
     state: &State,
     transport: &dyn Transport,
     options: ConnectOptions,
-) -> anyhow::Result<()> {
+    cancel: &AtomicBool,
+) -> anyhow::Result<bool> {
     use std::io::{Read, Write};
     let client = state
         .client
@@ -310,6 +330,9 @@ fn connect(
     ))?;
     let deadline = Instant::now() + SIGN_IN_TIMEOUT;
     let code = loop {
+        if cancel.swap(false, Ordering::SeqCst) {
+            return Ok(false);
+        }
         anyhow::ensure!(Instant::now() < deadline, "Google sign-in timed out");
         let (mut stream, _) = match listener.accept() {
             Ok(connection) => connection,
@@ -382,7 +405,7 @@ fn connect(
     calendar_sync::save_config(&transaction, &config)?;
     google_calendar::save_refresh_token(&transaction, &refresh_token)?;
     transaction.commit()?;
-    Ok(())
+    Ok(true)
 }
 
 /// Revoke and forget locally even when Google is unreachable, so the user is

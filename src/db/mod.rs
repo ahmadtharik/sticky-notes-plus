@@ -1,4 +1,5 @@
 pub mod attachments;
+pub mod backup;
 pub mod export;
 pub mod migrations;
 pub mod notes;
